@@ -25,10 +25,10 @@ extern "C" {
 #include "ui_helpers.h"
 #include "ui_events.h"
 
-extern lv_obj_t * windRoseObj;
 ///////////////////// SCREENS ////////////////////
 
 #include "ui_Screen1.h"
+#include "ui_Screen2.h"
 
 ///////////////////// VARIABLES ////////////////////
 

@@ -25,7 +25,13 @@ extern lv_obj_t * ui_LabelLU2;
 extern lv_obj_t * ui_LabelTime;
 extern lv_obj_t * ui_LabelIP;
 extern lv_obj_t * ui_Label3;
-extern lv_obj_t * windRoseObj;
+extern lv_obj_t * ui_Chart1;
+extern lv_obj_t * ui_Chart1_Xaxis;
+extern lv_obj_t * ui_Chart1_Yaxis1;
+extern lv_obj_t * ui_Chart1_Yaxis2;
+extern void ui_event_ButtonSettings(lv_event_t * e);
+extern lv_obj_t * ui_ButtonSettings;
+extern lv_obj_t * ui_Label1;
 // CUSTOM VARIABLES
 
 #ifdef __cplusplus
