@@ -2663,19 +2663,31 @@ void loop() {
 
       if (sensorHistory[0] != nullptr && sensorHistoryCount[0] > 0) {
         int idx = (sensorHistoryIndex[0] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
-        Blynk.virtualWrite(V21, sensorHistory[0][idx].hum);
+        float hum = sensorHistory[0][idx].hum;
+        float temp = sensorHistory[0][idx].temp;
+        float abshum =  (6.112 * pow(2.71828, ((17.67 * temp)/(temp + 243.5))) * hum * 2.1674)/(273.15 + temp);
+        Blynk.virtualWrite(V21, abshum);
       }
       if (sensorHistory[1] != nullptr && sensorHistoryCount[1] > 0) {
         int idx = (sensorHistoryIndex[1] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
-        Blynk.virtualWrite(V22, sensorHistory[1][idx].hum);
+        float hum = sensorHistory[1][idx].hum;
+        float temp = sensorHistory[1][idx].temp;
+        float abshum =  (6.112 * pow(2.71828, ((17.67 * temp)/(temp + 243.5))) * hum * 2.1674)/(273.15 + temp);
+        Blynk.virtualWrite(V22, abshum);
       }
       if (sensorHistory[2] != nullptr && sensorHistoryCount[2] > 0) {
         int idx = (sensorHistoryIndex[2] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
-        Blynk.virtualWrite(V23, sensorHistory[2][idx].hum);
+        float hum = sensorHistory[2][idx].hum;
+        float temp = sensorHistory[2][idx].temp;
+        float abshum =  (6.112 * pow(2.71828, ((17.67 * temp)/(temp + 243.5))) * hum * 2.1674)/(273.15 + temp);
+        Blynk.virtualWrite(V23, abshum);
       }
       if (sensorHistory[3] != nullptr && sensorHistoryCount[3] > 0) {
         int idx = (sensorHistoryIndex[3] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
-        Blynk.virtualWrite(V24, sensorHistory[3][idx].hum);
+        float hum = sensorHistory[3][idx].hum;
+        float temp = sensorHistory[3][idx].temp;
+        float abshum =  (6.112 * pow(2.71828, ((17.67 * temp)/(temp + 243.5))) * hum * 2.1674)/(273.15 + temp);
+        Blynk.virtualWrite(V24, abshum);
       }
   }
  // every(60000){
