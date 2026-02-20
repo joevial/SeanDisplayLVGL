@@ -1,111 +1,76 @@
 #include <lvgl.h>                            // lvgl version 9.2.2
 #include <PINS_JC4827W543.h>                //dev device pins library
 #include "TAMC_GT911.h"                     // TAMC_GT911 library
-#include <Preferences.h>
-#include <WiFiUdp.h>
+#include "BH1750.h"
 #include <Arduino.h>
 #include <esp_efuse.h>
 #include <esp_mac.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <esp_now.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include "time.h"
 #include "esp_sntp.h"
-#include <WiFiManager.h> 
+//#include <WiFiManager.h> 
 #include "ArduinoOTA.h"
 #include <BlynkSimpleEsp32.h>
+#include <Preferences.h>
 #include <math.h>
-bool credentialRequestReceived = false;
-uint8_t requestingDeviceMAC[6] = {0};
-
-#define MSG_MIN_INTERVAL 3000 
-// Add near other globals
-struct TimelinePoint {
-  time_t timestamp;
-  float temp1;
-  float temp2;
-  bool has_temp1;
-  bool has_temp2;
-};
-TimelinePoint* g_currentTimeline = nullptr;
-int g_currentTimelineCount = 0;
-static uint8_t espnow_pmk[16] = {0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
-                                  0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F, 0x3C};
-static uint8_t espnow_lmk[16] = {0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA,
-                                  0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22};
-
-WiFiUDP udp;
-const uint16_t UDP_PORT = 4210;
-uint8_t broadcastMAC[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-
-typedef struct {
-  char ssid[32];
-  char password[64];
-  uint8_t magic[4];  // Magic bytes to identify valid credential packets
-} wifi_credentials_t;
-
-
-
-void sendWiFiCredentialsToDevice(uint8_t* targetMAC) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected, cannot send credentials");
-    return;
-  }
-  
-  uint8_t currentChannel;
-  wifi_second_chan_t second;
-  esp_wifi_get_channel(&currentChannel, &second);
-  Serial.printf("Sending credentials on WiFi channel: %d\n", currentChannel);
-  
-  String currentSSID = WiFi.SSID();
-  String currentPSK = WiFi.psk();
-  
-  wifi_credentials_t creds;
-  memset(&creds, 0, sizeof(creds));
-  strncpy(creds.ssid, currentSSID.c_str(), sizeof(creds.ssid) - 1);
-  strncpy(creds.password, currentPSK.c_str(), sizeof(creds.password) - 1);
-  creds.magic[0] = 0xCA;
-  creds.magic[1] = 0xFE;
-  creds.magic[2] = 0xBA;
-  creds.magic[3] = 0xBE;
-  
-  Serial.printf("Sending credentials to %02X:%02X:%02X:%02X:%02X:%02X\n",
-                targetMAC[0], targetMAC[1], targetMAC[2],
-                targetMAC[3], targetMAC[4], targetMAC[5]);
-  
-  if (esp_now_is_peer_exist(targetMAC)) {
-    esp_now_del_peer(targetMAC);
-  }
-  
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, targetMAC, 6);
-  peerInfo.channel = currentChannel;
-  peerInfo.encrypt = false;  // ✅ TEMPORARY - test without encryption
-  // memcpy(peerInfo.lmk, espnow_lmk, 16);  // Comment out
-  peerInfo.ifidx = WIFI_IF_STA;
-  
-  if (esp_now_add_peer(&peerInfo) == ESP_OK) {
-    Serial.println("Peer added successfully");
-    
-    for (int attempt = 0; attempt < 10; attempt++) {
-      esp_err_t result = esp_now_send(targetMAC, (uint8_t *)&creds, sizeof(creds));
-      Serial.printf("Attempt %d: %s\n", attempt + 1,
-                    result == ESP_OK ? "OK" : "FAIL");
-      delay(100);
-    }
-  } else {
-    Serial.println("Failed to add peer!");
-  }
-  
-  if (esp_now_is_peer_exist(targetMAC)) {
-    esp_now_del_peer(targetMAC);
-  }
-  
-  Serial.println("Credentials transmission complete");
-}
-// ---- squareline Studio exported UI headers ----
 #include "ui.h"
+// Add these global variables near the top of your file (after includes)
+#define DUPLICATE_REJECT_MS 2000
+float currentAvgWindow = 60.0;   // Default 60 seconds
+float currentGustWindow = 1.0;   // Default 1 second
+static bool chart_needs_init = false;
+static bool chart_needs_update = false;
+// Secondary I2C bus for BH1750 (pins 17=SDA, 18=SCL)
+TwoWire I2C_BH1750 = TwoWire(1);   // Use I2C bus #1
+BH1750 lightMeter;
+float windOffsetPercent = 1.0f;   // multiplier applied to wind values (1.0 = no change)
+int   brightnessOffset  = 128;      // raw value from Spinbox3 added to BH1750 result or used as manual
+bool  autoBrightness    = true;   // Switch1
+bool  blynkEnabled      = true;   // Switch2
+bool  blynkWasEnabled   = true;   // track previous state to detect "just turned on"
+
+// Helper: clamp int to [lo, hi]
+static inline int clampInt(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+// Backlight PWM config
+#define BL_PWM_FREQ       5000
+#define BL_PWM_RESOLUTION 12         // 12-bit: 0-4095
+#define BL_MIN            40         // Minimum brightness (avoids fully off)
+#define BL_MAX            4095       // Maximum brightness
+#define BL_LUX_MIN       5.0f        // Lux level that maps to BL_MIN
+#define BL_LUX_MAX       1000.0f     // Lux level that maps to BL_MAX
+float blGamma = 1.0f;  
+bool connected = false;
+unsigned long reconnectTime = 0;
+static unsigned long lastManualBrightnessSet = 0;
+#define BRIGHTNESS_DEBOUNCE_MS 1200   // skip auto-update for 1.2s after manual set
+
+enum WifiStartupState {
+    WIFI_STARTUP_INIT,           // Initial state - set up WiFi mode
+    WIFI_STARTUP_SCAN,           // Scanning networks
+    WIFI_STARTUP_CHECK_CREDS,    // Check for saved credentials
+    WIFI_STARTUP_CONNECTING,     // Connecting to WiFi
+    WIFI_STARTUP_COMPLETE        // Done
+};
+
+WifiStartupState wifiStartupState = WIFI_STARTUP_INIT;
+unsigned long wifiStartupStepTime = 0;
+String startupSSID = "";
+String startupPassword = "";
+// WiFi connection state
+bool wifiConfigured = false;
+bool wifiConnecting = false;
+unsigned long wifiConnectStartTime = 0;
+bool autoConnectMode = false;  // Track if we're auto-connecting with saved creds
+#define WIFI_CONNECT_TIMEOUT 20000  // 20 seconds
+// UDP Configuration
+WiFiUDP udp;
+const int UDP_PORT = 4210;
 
 // ---- Touch Configuration ----
 #define TOUCH_SDA    8
@@ -118,55 +83,65 @@ unsigned long s1LastMsgTime = 0;
 unsigned long s2LastMsgTime = 0;
 #define MSG_MIN_INTERVAL 3000  
 TAMC_GT911 touchController = TAMC_GT911(TOUCH_SDA, TOUCH_SCL, TOUCH_INT, TOUCH_RST, TOUCH_WIDTH, TOUCH_HEIGHT);
+
+// ========== SENSOR HISTORY STRUCTURE ==========
+#define NUM_SENSORS 4
+#define SENSOR_HISTORY_SIZE 500
+// Track last message time for each sensor
+unsigned long lastTempMsgTime[NUM_SENSORS] = {0};
+unsigned long lastWindMsgTime = 0;
+struct SensorReading {
+    float temp;
+    float hum;
+    float pres;
+    unsigned long timestamp;
+};
+
+SensorReading *sensorHistory[NUM_SENSORS];
+int sensorHistoryIndex[NUM_SENSORS] = {0};
+int sensorHistoryCount[NUM_SENSORS] = {0};
+int sensorHistoryCapacity = SENSOR_HISTORY_SIZE;
+
+// ========== CHART STATE ==========
+enum ChartDataType {
+    CHART_TEMP,
+    CHART_HUM,
+    CHART_PRES,
+    CHART_WIND_SPEED
+};
+
+struct ChartState {
+    ChartDataType dataType;
+    int sensorIndex;
+    const char* title;
+    const char* units;
+} currentChart;
+// Add these global variables near the top with other globals
+static unsigned long lastChartUpdate = 0;
+static int lastChartDataCount = -1;
+static ChartDataType lastChartType = CHART_TEMP;
+static int lastChartSensor = -1;
+
+// Custom scale objects for charts
+static lv_obj_t * chart_scale_y = NULL;
+static lv_obj_t * chart_container = NULL;
+static lv_obj_t * chart_x_axis_container = NULL;
+// WiFi credential message structure (for ESP-NOW) - NO ENCRYPTION
+typedef struct {
+  char ssid[32];
+  char password[64];
+  uint8_t magic[4];  // Magic bytes: 0xCA, 0xFE, 0xBA, 0xBE
+} wifi_credentials_t;
+
+// Credential request message structure - NO ENCRYPTION
+typedef struct {
+  uint8_t magic[4];  // Magic bytes: 0xDE, 0xAD, 0xBE, 0xEF
+} credential_request_t;
+
 // Fallback capacities and buffers if PSRAM not available
 #define TEMP_FALLBACK_SIZE 128
+#define TEMP_HISTORY_SIZE 500
 #define WIND_HISTORY_FALLBACK_SIZE 256
-#define NUM_TEMP_SENSORS 4
-#define TEMP_HISTORY_SIZE 1440  // 24 hours at 1 minute intervals
-
-struct SensorData {
-  float temp;
-  float hum;
-  float pres;
-  time_t timestamp;
-};
-
-
-SensorData* sensorHistory[NUM_TEMP_SENSORS] = {nullptr, nullptr, nullptr, nullptr};
-int sensorHistoryIndex[NUM_TEMP_SENSORS] = {0};
-int sensorHistoryCount[NUM_TEMP_SENSORS] = {0};
-unsigned long sensorLastUpdate[NUM_TEMP_SENSORS] = {0};
-
-// Wind sensor (sensor 0)
-float s0temp = 999, s0hum = 0, s0pres = 0;
-float s0windgust = 0, s0avgwind = 0, s0instwind = 999, s0winddirV = 0;
-unsigned long s0LastUpdate = 0;
-
-// Current temperature values for display
-float sensorTemps[NUM_TEMP_SENSORS] = {999, 999, 999, 999};
-
-// Chart series for each sensor
-lv_chart_series_t* temp_chart_series[NUM_TEMP_SENSORS] = {nullptr, nullptr, nullptr, nullptr};
-bool seriesVisible[NUM_TEMP_SENSORS] = {true, true, true, true};  // All visible by default
-
-// Legend objects
-lv_obj_t* legend_container = NULL;
-lv_obj_t* legend_labels[NUM_TEMP_SENSORS] = {nullptr, nullptr, nullptr, nullptr};
-
-// Colors for each sensor
-lv_color_t sensorColors[NUM_TEMP_SENSORS] = {
-  lv_palette_main(LV_PALETTE_RED),
-  lv_palette_main(LV_PALETTE_BLUE),
-  lv_palette_main(LV_PALETTE_GREEN),
-  lv_palette_main(LV_PALETTE_ORANGE)
-};
-
-const char* sensorNames[NUM_TEMP_SENSORS] = {
-  "Sensor 1",
-  "Sensor 2", 
-  "Sensor 3",
-  "Sensor 4"
-};
 
 enum SFEWeatherMeterKitAnemometerAngles
 {
@@ -190,37 +165,23 @@ enum SFEWeatherMeterKitAnemometerAngles
 };
 
 #define SFE_WIND_VANE_DEGREES_PER_INDEX (360.0f / 16.0f)
-#define SFE_WMK_ADC_ANGLE_0_0 3080
-#define SFE_WMK_ADC_ANGLE_22_5 1560
-#define SFE_WMK_ADC_ANGLE_45_0 1781
-#define SFE_WMK_ADC_ANGLE_67_5 290
-#define SFE_WMK_ADC_ANGLE_90_0 330
-#define SFE_WMK_ADC_ANGLE_112_5 230
-#define SFE_WMK_ADC_ANGLE_135_0 680
-#define SFE_WMK_ADC_ANGLE_157_5 460
-#define SFE_WMK_ADC_ANGLE_180_0 1080
-#define SFE_WMK_ADC_ANGLE_202_5 910
-#define SFE_WMK_ADC_ANGLE_225_0 2420
-#define SFE_WMK_ADC_ANGLE_247_5 2300
-#define SFE_WMK_ADC_ANGLE_270_0 3954
+#define SFE_WMK_ADC_ANGLE_0_0 3118
+#define SFE_WMK_ADC_ANGLE_22_5 1526
+#define SFE_WMK_ADC_ANGLE_45_0 1761
+#define SFE_WMK_ADC_ANGLE_67_5 199
+#define SFE_WMK_ADC_ANGLE_90_0 237
+#define SFE_WMK_ADC_ANGLE_112_5 123
+#define SFE_WMK_ADC_ANGLE_135_0 613
+#define SFE_WMK_ADC_ANGLE_157_5 371
+#define SFE_WMK_ADC_ANGLE_180_0 1040
+#define SFE_WMK_ADC_ANGLE_202_5 859
+#define SFE_WMK_ADC_ANGLE_225_0 2451
+#define SFE_WMK_ADC_ANGLE_247_5 2329
+#define SFE_WMK_ADC_ANGLE_270_0 3984
 #define SFE_WMK_ADC_ANGLE_292_5 3290
-#define SFE_WMK_ADC_ANGLE_315_0 3586
-#define SFE_WMK_ADC_ANGLE_337_5 2712
+#define SFE_WMK_ADC_ANGLE_315_0 3616
+#define SFE_WMK_ADC_ANGLE_337_5 2755
 #define SFE_WMK_ADC_RESOLUTION 12
-
-typedef struct {
-  uint8_t magic[4];  // Magic bytes: 0xDE, 0xAD, 0xBE, 0xEF
-} credential_request_t;
-
-typedef struct {
-  float sliderAvg;
-  float sliderGust;
-  uint8_t magic[4];  // Magic bytes: 0xAB, 0xCD, 0xEF, 0x12
-} slider_values_t;
-
-// Add these global variables:
-float sliderAvg = 10.0;   // Default slider values
-float sliderGust = 20.0;
 
 struct SFEWeatherMeterKitCalibrationParams
 {
@@ -230,37 +191,33 @@ struct SFEWeatherMeterKitCalibrationParams
 SFEWeatherMeterKitCalibrationParams _calibrationParams;
 
 // Wind Rose data structures
-#define WIND_DIRECTIONS 16  // 16 compass directions (N, NNE, NE, ENE, E, etc.)
-#define WIND_SPEED_BINS 5   // 5 speed ranges: 0-8, 8-16, 16-24, 24-32, >32
-#define WIND_HISTORY_SIZE 1440  // 24 hours at 1 minute intervals
+#define WIND_DIRECTIONS 16
+#define WIND_SPEED_BINS 5
+#define WIND_HISTORY_SIZE 1440
 
 struct WindDataPoint {
     float speed;
+    float gust;      // ADD THIS
     float direction;
     unsigned long timestamp;
 };
 
-// Wind rose histogram: [direction][speed_bin]
 int *windRoseData[WIND_DIRECTIONS];
 WindDataPoint *windHistory = nullptr;
 int windHistoryIndex = 0;
 int windHistoryCount = 0;
 
 struct TempDataPoint {
-    float temp;      // s1temp
-    float temp2;      // s2temp
+    float temp;
     unsigned long timestamp;
 };
 
-static TempDataPoint tempHistory1Fallback[TEMP_FALLBACK_SIZE];
-static TempDataPoint tempHistory2Fallback[TEMP_FALLBACK_SIZE];
+static TempDataPoint tempHistoryFallback[TEMP_FALLBACK_SIZE];
 static WindDataPoint windHistoryFallback[WIND_HISTORY_FALLBACK_SIZE];
 static int windRoseFallback[WIND_DIRECTIONS][WIND_SPEED_BINS];
 
-// dynamic capacities used at runtime
 int tempHistoryCapacity = 0;
 int windHistoryCapacity = WIND_HISTORY_SIZE;
-
 
 char auth[] = "19oL8t8mImCdoUqYhfhk6DADL7540f8s";
 int hours, mins, secs;
@@ -269,95 +226,347 @@ unsigned long s1LastUpdate = 0;
 struct tm timeinfo;
 bool isSetNtp = false;
 
-
-#define TEMP_HISTORY_SIZE 500
-TempDataPoint *tempHistory1 = nullptr;  // For s1temp
-TempDataPoint *tempHistory2 = nullptr;  // For s2temp
-int tempHistoryIndex1 = 0;
-int tempHistoryIndex2 = 0;
-int tempHistoryCount1 = 0;
-int tempHistoryCount2 = 0;
-
-
-
-
+TempDataPoint *tempHistory = nullptr;
+int tempHistoryIndex = 0;
+int tempHistoryCount = 0;
+void handleWifiStartup();
 // Function declarations
 void cbSyncTime(struct timeval *tv);
 void initSNTP();
 void setTimezone();
 void onESPNowReceive(const esp_now_recv_info_t * info, const uint8_t *data, int len);
-void addTempToHistory(float temp, float hum, float pres, int sensorId);
-void drawTempGraph();
+void addTempToHistory(float temp);
+void addTempToHistory(int deviceId, float temp, float hum, float pres);
+void addSensorReading(int sensor, float temp, float hum, float pres);
+
 void drawWindSpeedGraph();
-void addWindData(float speed, float direction);
+void addWindData(float speed, float direction, float gust);
 void drawWindRose();
+void drawGenericChart();
+void handleUDP();
+SensorReading* getLatestReading(int sensor);
 void setup();
 void loop();
-float getWindDirection();
-static void legend_click_cb(lv_event_t* e);
-void createLegend();
-
-// Create legend
-void createLegend() {
-  if (legend_container != NULL) return;
-  
-  lv_obj_t* parent = lv_obj_get_parent(ui_Chart1);
-  
-  legend_container = lv_obj_create(parent);
-  lv_obj_set_size(legend_container, 200, 80);
-  lv_obj_align_to(legend_container, ui_Chart1, LV_ALIGN_OUT_RIGHT_TOP, 10, 0);
-  lv_obj_set_style_bg_opa(legend_container, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(legend_container, 0, 0);
-  lv_obj_set_style_pad_all(legend_container, 5, 0);
-  lv_obj_set_flex_flow(legend_container, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_flex_align(legend_container, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-  
-  for (int i = 0; i < NUM_TEMP_SENSORS; i++) {
-    legend_labels[i] = lv_label_create(legend_container);
-    lv_label_set_text(legend_labels[i], sensorNames[i]);
-    lv_obj_set_style_text_color(legend_labels[i], sensorColors[i], 0);
-    lv_obj_set_style_text_font(legend_labels[i], &lv_font_montserrat_12, 0);
-    lv_obj_add_flag(legend_labels[i], LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(legend_labels[i], legend_click_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_set_style_pad_all(legend_labels[i], 3, 0);
-  }
-}
-
-// Legend click callback
-static void legend_click_cb(lv_event_t* e) {
-  lv_obj_t* label = (lv_obj_t*)lv_event_get_target(e);
-  
-  // Find which sensor this label belongs to
-  for (int i = 0; i < NUM_TEMP_SENSORS; i++) {
-    if (legend_labels[i] == label) {
-      // Toggle visibility
-      seriesVisible[i] = !seriesVisible[i];
-      
-      // Update label appearance
-      if (seriesVisible[i]) {
-        lv_obj_set_style_text_color(label, sensorColors[i], 0);
-        lv_obj_set_style_text_opa(label, LV_OPA_COVER, 0);
-      } else {
-        lv_obj_set_style_text_color(label, lv_color_hex(0x808080), 0);
-        lv_obj_set_style_text_opa(label, LV_OPA_50, 0);
-      }
-      
-      // Redraw chart
-      drawTempGraph();
-      break;
-    }
-  }
-}
-// Add this helper function near the top with other function declarations
+float getWindDirection(u_int16_t adcValue);
 const char* getCardinalDirection(float degrees);
+void consoleLog(const char* message);
+//void sendSliderValuesToWindTransmitter();
 
-// Implement the function (add this before setup() or after getWindDirection())
+void loadSettings();
+void loadSettings() {
+    Preferences prefs;
+    prefs.begin("appsettings", true);
+    autoBrightness    = prefs.getBool("autoBright", true);
+    blynkEnabled      = prefs.getBool("blynkOn",    true);
+    brightnessOffset  = prefs.getInt ("brightOff",  128);
+    int sp4raw        = prefs.getInt ("windOffRaw", 0);
+    int savedAvg      = prefs.getInt ("avgWindow",  60);
+    int savedGust     = prefs.getInt ("gustWindow", 1);
+    int savedGamma    = prefs.getInt ("blGamma",    10);
+    prefs.end();
+
+    blGamma           = savedGamma / 10.0f;
+    windOffsetPercent = 1.0f + (sp4raw / 1000.0f);
+    currentAvgWindow  = (float)savedAvg;
+    currentGustWindow = (float)savedGust;
+    blynkWasEnabled   = blynkEnabled;
+
+    Serial.printf("loadSettings: autoBright=%d blynk=%d brightOff=%d windOffRaw=%d avg=%d gust=%d gamma=%d\n",
+                  autoBrightness, blynkEnabled, brightnessOffset, sp4raw, savedAvg, savedGust, savedGamma);
+}
+
+// Console logging helper
+void consoleLog(const char* message) {
+    // Always print to serial first
+    Serial.println(message);
+    
+    if (ui_LabelConsole == NULL) {
+        return;
+    }
+    
+    const char* currentText = lv_label_get_text(ui_LabelConsole);
+    static char buffer[1024];
+    
+    // Add new message to existing text
+    snprintf(buffer, sizeof(buffer), "%s%s\n", currentText, message);
+    lv_label_set_text(ui_LabelConsole, buffer);
+}
+
+
+bool loadWifiCredentials(String &ssid, String &password);
+// Add this function to load WiFi credentials from preferences
+bool loadWifiCredentials(String &ssid, String &password) {
+    Preferences preferences;
+    preferences.begin("wifi", true);  // true = read-only
+    ssid = preferences.getString("ssid", "");
+    password = preferences.getString("password", "");
+    preferences.end();
+    
+    Serial.printf("loadWifiCredentials: SSID='%s', Password='%s'\n", ssid.c_str(), password.c_str());
+    
+    return (ssid.length() > 0);
+}
+static int luxToBrightness(float lux, int offset);
+static int luxToBrightness(float lux, int offset) {
+    float clamped = lux < BL_LUX_MIN ? BL_LUX_MIN
+                  : lux > BL_LUX_MAX ? BL_LUX_MAX
+                  : lux;
+
+    // Logarithmic normalisation → 0.0 … 1.0
+    float logMin  = log(BL_LUX_MIN);
+    float logMax  = log(BL_LUX_MAX);
+    float norm    = (log(clamped) - logMin) / (logMax - logMin);  // 0–1
+
+    // Gamma correction — controlled by blGamma (Spinbox5 / 10)
+    float curved  = powf(norm, blGamma);                          // 0–1
+
+    int brightness = (int)(BL_MIN + (BL_MAX - BL_MIN) * curved);
+    brightness    += (offset * 16);
+    return brightness;
+}
+
+void checkWifiConnection();
+
+// MODIFIED: checkWifiConnection to trigger network scan on timeout
+void checkWifiConnection() {
+    if (!wifiConnecting) return;
+    
+    unsigned long elapsed = millis() - wifiConnectStartTime;
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("WiFi connected successfully!");
+        Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+        Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+        
+        consoleLog("WiFi connected successfully!");
+        
+        char logBuf[128];
+        snprintf(logBuf, sizeof(logBuf), "IP: %s", WiFi.localIP().toString().c_str());
+        consoleLog(logBuf);
+        
+        snprintf(logBuf, sizeof(logBuf), "RSSI: %d dBm", WiFi.RSSI());
+        consoleLog(logBuf);
+        
+        wifiConnecting = false;
+        wifiConfigured = true;
+        
+        // SNTP is already initialized in setup() - just log it
+        Serial.println("Time sync active");
+        consoleLog("Time sync active");
+        
+        // Initialize Blynk if not already done
+        if (!connected && blynkEnabled) {
+            Blynk.config(auth, IPAddress(216, 110, 224, 105), 8080);
+            Blynk.connect();
+            Serial.println("Blynk connecting...");
+            consoleLog("Blynk connecting...");
+        }
+        
+        // Only auto-switch to main screen if we connected using saved credentials on boot
+        if (autoConnectMode) {
+            Serial.println("Auto-connect mode - switching to main screen");
+            consoleLog("Loading main screen...");
+            delay(1000);  // Brief delay to see the success message
+            lv_scr_load(ui_ScreenMain);
+            autoConnectMode = false;  // Reset flag
+        }
+    } 
+    else if (elapsed > WIFI_CONNECT_TIMEOUT) {
+        Serial.println("WiFi connection timeout!");
+        Serial.printf("WiFi status: %d\n", WiFi.status());
+        
+        consoleLog("WiFi connection timeout!");
+        consoleLog("Check credentials and try again");
+        wifiConnecting = false;
+        wifiConfigured = false;
+        autoConnectMode = false;  // Reset flag on failure
+        
+        // If this was during startup, the state machine will trigger a scan
+    }
+    else {
+        // Still connecting - show progress every 2 seconds
+        static unsigned long lastDot = 0;
+        if (millis() - lastDot > 2000) {
+            Serial.printf("Still connecting... (status: %d, elapsed: %lu ms)\n", WiFi.status(), elapsed);
+            consoleLog("...");
+            lastDot = millis();
+        }
+    }
+}
+
+
+// WiFi functions with C linkage (called from C files)
+extern "C" {
+    void applySettingsToUI(void);
+    void populateWifiList();
+    void SaveWifiFromUI(lv_event_t * e);
+    void updateSettingsWifiInfo();
+    //void sendSliderValuesToWindTransmitter();
+    void saveSettings();
+}
+
+extern "C" void applySettingsToUI() {
+    if (ui_ScreenSettings == NULL) return;
+
+    if (ui_Switch1 != NULL) {
+        if (autoBrightness) lv_obj_add_state(ui_Switch1, LV_STATE_CHECKED);
+        else                lv_obj_remove_state(ui_Switch1, LV_STATE_CHECKED);
+    }
+    if (ui_Switch2 != NULL) {
+        if (blynkEnabled) lv_obj_add_state(ui_Switch2, LV_STATE_CHECKED);
+        else              lv_obj_remove_state(ui_Switch2, LV_STATE_CHECKED);
+    }
+    if (ui_Spinbox1 != NULL) lv_spinbox_set_value(ui_Spinbox1, (int32_t)currentAvgWindow);
+    if (ui_Spinbox2 != NULL) lv_spinbox_set_value(ui_Spinbox2, (int32_t)currentGustWindow);
+    if (ui_Spinbox3 != NULL) lv_spinbox_set_value(ui_Spinbox3, brightnessOffset);
+    if (ui_Spinbox4 != NULL) lv_spinbox_set_value(ui_Spinbox4, (int32_t)((windOffsetPercent - 1.0f) * 1000.0f));
+    if (ui_Spinbox5 != NULL) lv_spinbox_set_value(ui_Spinbox5, (int32_t)(blGamma * 10.0f));
+    Serial.println("Settings applied to UI");
+    Serial.printf("autoBrightness=%d blynkEnabled=%d avgWindow=%.1f gustWindow=%.1f brightOffset=%d windOffsetRaw=%d blGamma=%d\n",
+                  autoBrightness, blynkEnabled, currentAvgWindow, currentGustWindow, brightnessOffset, (int32_t)((windOffsetPercent - 1.0f) * 1000.0f), (int32_t)(blGamma * 10.0f));
+}
+
+extern "C" void updateBacklightLive(bool autoMode, int offset) {
+    autoBrightness   = autoMode;
+    brightnessOffset = offset;
+    int brightness;
+    if (autoMode) {
+        float lux = lightMeter.measurementReady() ? lightMeter.readLightLevel() : 0.0f;
+        if (lux < 0) lux = 0;
+        brightness = (lux > 0) ? luxToBrightness(lux, offset)
+                                : clampInt(offset * 16, 0, BL_MAX);
+    } else {
+        brightness = offset * 16;
+    }
+    lastManualBrightnessSet = millis();
+    ledcWrite(GFX_BL, clampInt(brightness, 0, BL_MAX));
+}
+
+extern "C" void saveSettings() {
+    if (ui_Switch1  == NULL || ui_Switch2  == NULL ||
+        ui_Spinbox3 == NULL || ui_Spinbox4 == NULL ||
+        ui_Spinbox1 == NULL || ui_Spinbox2 == NULL) return;
+
+    bool newAutoBright  = lv_obj_has_state(ui_Switch1, LV_STATE_CHECKED);
+    bool newBlynk       = lv_obj_has_state(ui_Switch2, LV_STATE_CHECKED);
+    int  newBrightOff   = (int)lv_spinbox_get_value(ui_Spinbox3);
+    int  newWindOffRaw  = (int)lv_spinbox_get_value(ui_Spinbox4);
+    int  newAvgWindow   = (int)lv_spinbox_get_value(ui_Spinbox1);
+    int  newGustWindow  = (int)lv_spinbox_get_value(ui_Spinbox2);
+    int  newGammaRaw  =   (int)lv_spinbox_get_value(ui_Spinbox5);
+    Preferences prefs;
+    prefs.begin("appsettings", false);
+    prefs.putBool("autoBright", newAutoBright);
+    prefs.putBool("blynkOn",    newBlynk);
+    prefs.putInt ("brightOff",  newBrightOff);
+    prefs.putInt ("windOffRaw", newWindOffRaw);
+    prefs.putInt ("avgWindow",  newAvgWindow);
+    prefs.putInt ("gustWindow", newGustWindow);
+    prefs.putInt ("blGamma",    newGammaRaw);
+    prefs.end();
+
+    // Apply immediately
+    autoBrightness   = newAutoBright;
+    brightnessOffset = newBrightOff;
+    windOffsetPercent = 1.0f + (newWindOffRaw / 1000.0f);
+    currentAvgWindow  = newAvgWindow;
+    currentGustWindow = newGustWindow;
+    blGamma = newGammaRaw / 10.0f;
+    // Handle Blynk enable/disable transition
+    bool wasEnabled = blynkEnabled;
+    blynkEnabled    = newBlynk;
+
+    if (blynkEnabled && !wasEnabled) {
+        Serial.println("Blynk re-enabled by user — connecting");
+        consoleLog("Blynk enabled — connecting...");
+        Blynk.config(auth, IPAddress(216, 110, 224, 105), 8080);
+        if (WiFi.status() == WL_CONNECTED) Blynk.connect();
+    } else if (!blynkEnabled && wasEnabled) {
+        Serial.println("Blynk disabled by user");
+        consoleLog("Blynk disabled");
+        Blynk.disconnect();
+    }
+
+    Serial.printf("saveSettings: autoBright=%d blynk=%d brightOff=%d windOffRaw=%d avgWin=%d gustWin=%d gamma=%f\n",
+                  autoBrightness, blynkEnabled, brightnessOffset, newWindOffRaw, newAvgWindow, newGustWindow, blGamma);
+    consoleLog("Settings saved.");
+}
+
+
+extern "C" void sendSliderValuesToWindTransmitter() {
+    if (!wifiConfigured || WiFi.status() != WL_CONNECTED) {
+        Serial.println("Cannot send slider values - WiFi not connected");
+        return;
+    }
+
+    // Read directly from spinboxes so we always send current UI values
+    // even if the user hasn't pressed Save yet
+    float avgVal  = (ui_Spinbox1 != NULL) ? (float)lv_spinbox_get_value(ui_Spinbox1) : currentAvgWindow;
+    float gustVal = (ui_Spinbox2 != NULL) ? (float)lv_spinbox_get_value(ui_Spinbox2) : currentGustWindow;
+
+    typedef struct {
+        float sliderAvg;
+        float sliderGust;
+        uint8_t magic[4];
+    } slider_values_t;
+
+    slider_values_t sliders;
+    sliders.sliderAvg  = avgVal;
+    sliders.sliderGust = gustVal;
+    sliders.magic[0] = 0xAB;
+    sliders.magic[1] = 0xCD;
+    sliders.magic[2] = 0xEF;
+    sliders.magic[3] = 0x12;
+
+    IPAddress broadcastIP = WiFi.localIP();
+    broadcastIP[3] = 255;
+
+    udp.beginPacket(broadcastIP, UDP_PORT);
+    udp.write((uint8_t *)&sliders, sizeof(sliders));
+    udp.endPacket();
+
+    Serial.printf("Sent slider values via UDP - Avg: %.1f, Gust: %.1f\n", avgVal, gustVal);
+
+    char logBuf[128];
+    snprintf(logBuf, sizeof(logBuf), "Sent: Avg=%.1fs, Gust=%.1fs", avgVal, gustVal);
+    consoleLog(logBuf);
+}
+
+// ========== UPDATE SETTINGS SCREEN WIFI INFO ==========
+extern "C" void updateSettingsWifiInfo() {
+    if (ui_LabelConnectedTo == NULL || ui_Label9 == NULL || ui_LabelIP2 == NULL) {
+        return;
+    }
+    
+    char buf[128];
+    
+    // Update SSID label
+    if (WiFi.status() == WL_CONNECTED) {
+        String ssid = WiFi.SSID();
+        snprintf(buf, sizeof(buf), "%s", ssid.c_str());
+        lv_label_set_text(ui_LabelConnectedTo, buf);
+        
+        // Update RSSI label
+        int rssi = WiFi.RSSI();
+        snprintf(buf, sizeof(buf), "RSSI: %d dB", rssi);
+        lv_label_set_text(ui_Label9, buf);
+        
+        // Update IP address label
+        IPAddress ip = WiFi.localIP();
+        snprintf(buf, sizeof(buf), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+        lv_label_set_text(ui_LabelIP2, buf);
+    } else {
+        lv_label_set_text(ui_LabelConnectedTo, "Not Connected");
+        lv_label_set_text(ui_Label9, "RSSI: -- dB");
+        lv_label_set_text(ui_LabelIP2, "0.0.0.0");
+    }
+}
+
+
 const char* getCardinalDirection(float degrees) {
-    // Normalize degrees to 0-360
     while (degrees < 0) degrees += 360;
     while (degrees >= 360) degrees -= 360;
     
-    // 16-point compass rose
     if (degrees < 11.25) return "N";
     else if (degrees < 33.75) return "NNE";
     else if (degrees < 56.25) return "NE";
@@ -378,15 +587,298 @@ const char* getCardinalDirection(float degrees) {
 }
 
 lv_obj_t * temp_chart = NULL;
-
-
+lv_chart_series_t * temp_chart_series = NULL;
+lv_obj_t * temp_scale_y = NULL;
 lv_obj_t * temp_container = NULL;
-// Temperature chart label popup (simpler overlay approach for LVGL v9.3)
-//lv_chart_series_t * temp_chart_series = NULL;
-lv_chart_series_t * temp_chart_series2 = NULL;  // ADD THIS LINE
 static lv_obj_t * temp_label_popup = NULL;
-static lv_obj_t * temp_scale_y = NULL;
-static lv_obj_t * time_labels[5] = {NULL, NULL, NULL, NULL, NULL};
+
+// Chart label popup for generic chart
+static lv_obj_t * chart_label_popup = NULL;
+static void chart_draw_label_cb(lv_event_t * e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  lv_obj_t * chart = (lv_obj_t*) lv_event_get_target(e);
+  
+  if(code == LV_EVENT_PRESSED || code == LV_EVENT_PRESSING) {
+    int32_t id = lv_chart_get_pressed_point(chart);
+    
+    if(id == LV_CHART_POINT_NONE) {
+      if(chart_label_popup != NULL) {
+        lv_obj_add_flag(chart_label_popup, LV_OBJ_FLAG_HIDDEN);
+      }
+      return;
+    }
+    
+    // Special handling for wind speed chart
+    if (currentChart.dataType == CHART_WIND_SPEED) {
+      if (windHistory == nullptr || windHistoryCount == 0) {
+        if(chart_label_popup != NULL) {
+          lv_obj_add_flag(chart_label_popup, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+      }
+      
+      int chartPoints = lv_chart_get_point_count(chart);
+      
+      if (id < 0 || id >= chartPoints) {
+        if(chart_label_popup != NULL) {
+          lv_obj_add_flag(chart_label_popup, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+      }
+      
+      int startIdx = (windHistoryIndex - windHistoryCount + windHistoryCapacity) % windHistoryCapacity;
+      int historyIdx;
+      
+      if (windHistoryCount <= chartPoints) {
+        historyIdx = id;
+      } else {
+        if (chartPoints <= 1) {
+          historyIdx = 0;
+        } else {
+          historyIdx = (id * (windHistoryCount - 1)) / (chartPoints - 1);
+        }
+      }
+      
+      if (historyIdx < 0 || historyIdx >= windHistoryCount) {
+        if(chart_label_popup != NULL) {
+          lv_obj_add_flag(chart_label_popup, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+      }
+      
+      int idx = (startIdx + historyIdx) % windHistoryCapacity;
+      
+      if (idx < 0 || idx >= windHistoryCapacity) {
+        if(chart_label_popup != NULL) {
+          lv_obj_add_flag(chart_label_popup, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+      }
+      
+      if (windHistory[idx].timestamp == 0) {
+        if(chart_label_popup != NULL) {
+          lv_obj_add_flag(chart_label_popup, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+      }
+      
+      float speed = windHistory[idx].speed;
+      float gust = windHistory[idx].gust;
+      time_t timestamp = (time_t)(windHistory[idx].timestamp / 1000);  // Convert millis to seconds
+      
+      // Create label popup if it doesn't exist
+      if(chart_label_popup == NULL) {
+        chart_label_popup = lv_label_create(lv_scr_act());
+        if (chart_label_popup == NULL) {
+          return;
+        }
+        lv_obj_set_style_bg_color(chart_label_popup, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(chart_label_popup, LV_OPA_80, 0);
+        lv_obj_set_style_text_color(chart_label_popup, lv_color_white(), 0);
+        lv_obj_set_style_pad_all(chart_label_popup, 8, 0);
+        lv_obj_set_style_radius(chart_label_popup, 4, 0);
+        lv_obj_set_style_border_width(chart_label_popup, 1, 0);
+        lv_obj_set_style_border_color(chart_label_popup, lv_color_white(), 0);
+        lv_obj_set_style_border_opa(chart_label_popup, LV_OPA_50, 0);
+        lv_obj_add_flag(chart_label_popup, LV_OBJ_FLAG_FLOATING);
+      }
+      
+      // Format the label text
+      static char buf[64];
+      if (timestamp > 0 && timestamp >= 1000000000) {
+        struct tm timeinfo_buf;
+        struct tm* timeinfo = localtime_r(&timestamp, &timeinfo_buf);
+        
+        if (timeinfo != NULL) {
+          int hour = timeinfo->tm_hour;
+          int min = timeinfo->tm_min;
+          const char* ampm = (hour >= 12) ? "PM" : "AM";
+          if (hour > 12) hour -= 12;
+          else if (hour == 0) hour = 12;
+          snprintf(buf, sizeof(buf), "%.1f kph\nGust: %.1f kph\n%d:%02d %s", speed, gust, hour, min, ampm);
+        } else {
+          snprintf(buf, sizeof(buf), "%.1f kph\nGust: %.1f kph", speed, gust);
+        }
+      } else {
+        snprintf(buf, sizeof(buf), "%.1f kph\nGust: %.1f kph", speed, gust);
+      }
+      
+      lv_label_set_text(chart_label_popup, buf);
+      
+      // Get point position on chart
+      lv_chart_series_t * ser = lv_chart_get_series_next(chart, NULL);
+      if(ser == NULL) {
+        return;
+      }
+      
+      lv_point_t p;
+      lv_chart_get_point_pos_by_id(chart, ser, id, &p);
+      
+      lv_area_t chart_coords;
+      lv_obj_get_coords(chart, &chart_coords);
+      
+      // Position label above the data point
+      lv_coord_t label_x = chart_coords.x1 + p.x;
+      lv_coord_t label_y = chart_coords.y1 + p.y - 45;
+      
+      lv_obj_update_layout(chart_label_popup);
+      lv_coord_t label_width = lv_obj_get_width(chart_label_popup);
+      
+      lv_obj_set_pos(chart_label_popup, label_x - (label_width / 2), label_y);
+      lv_obj_clear_flag(chart_label_popup, LV_OBJ_FLAG_HIDDEN);
+      
+      return;
+    }
+    
+    // Original code for sensor data (temp/hum/pres)
+    int sensor = currentChart.sensorIndex;
+    if(sensor < 0 || sensor >= NUM_SENSORS || 
+       sensorHistory[sensor] == nullptr || sensorHistoryCount[sensor] == 0) {
+      if(chart_label_popup != NULL) {
+        lv_obj_add_flag(chart_label_popup, LV_OBJ_FLAG_HIDDEN);
+      }
+      return;
+    }
+    
+    int chartPoints = lv_chart_get_point_count(chart);
+    
+    if (id < 0 || id >= chartPoints) {
+      if(chart_label_popup != NULL) {
+        lv_obj_add_flag(chart_label_popup, LV_OBJ_FLAG_HIDDEN);
+      }
+      return;
+    }
+    
+    int startIdx = (sensorHistoryIndex[sensor] - sensorHistoryCount[sensor] + sensorHistoryCapacity) % sensorHistoryCapacity;
+    int historyIdx;
+    
+    if (sensorHistoryCount[sensor] <= chartPoints) {
+      historyIdx = id;
+    } else {
+      if (chartPoints <= 1) {
+        historyIdx = 0;
+      } else {
+        historyIdx = (id * (sensorHistoryCount[sensor] - 1)) / (chartPoints - 1);
+      }
+    }
+    
+    if (historyIdx < 0 || historyIdx >= sensorHistoryCount[sensor]) {
+      if(chart_label_popup != NULL) {
+        lv_obj_add_flag(chart_label_popup, LV_OBJ_FLAG_HIDDEN);
+      }
+      return;
+    }
+    
+    int idx = (startIdx + historyIdx) % sensorHistoryCapacity;
+    
+    if (idx < 0 || idx >= sensorHistoryCapacity) {
+      if(chart_label_popup != NULL) {
+        lv_obj_add_flag(chart_label_popup, LV_OBJ_FLAG_HIDDEN);
+      }
+      return;
+    }
+    
+    if (sensorHistory[sensor][idx].timestamp == 0) {
+      if(chart_label_popup != NULL) {
+        lv_obj_add_flag(chart_label_popup, LV_OBJ_FLAG_HIDDEN);
+      }
+      return;
+    }
+    
+    // Get the value based on chart type
+    float value = 0;
+    const char* unit = "";
+    switch(currentChart.dataType) {
+      case CHART_TEMP:
+        value = sensorHistory[sensor][idx].temp;
+        unit = "°C";
+        break;
+      case CHART_HUM:
+        value = sensorHistory[sensor][idx].hum;
+        unit = "%";
+        break;
+      case CHART_PRES:
+        value = sensorHistory[sensor][idx].pres;
+        unit = "mbar";
+        break;
+      default:
+        value = 0;
+        unit = "";
+    }
+    
+    time_t timestamp = (time_t)sensorHistory[sensor][idx].timestamp;
+    
+    // Create label popup if it doesn't exist
+    if(chart_label_popup == NULL) {
+      chart_label_popup = lv_label_create(lv_scr_act());
+      if (chart_label_popup == NULL) {
+        return;
+      }
+      lv_obj_set_style_bg_color(chart_label_popup, lv_color_black(), 0);
+      lv_obj_set_style_bg_opa(chart_label_popup, LV_OPA_80, 0);
+      lv_obj_set_style_text_color(chart_label_popup, lv_color_white(), 0);
+      lv_obj_set_style_pad_all(chart_label_popup, 8, 0);
+      lv_obj_set_style_radius(chart_label_popup, 4, 0);
+      lv_obj_set_style_border_width(chart_label_popup, 1, 0);
+      lv_obj_set_style_border_color(chart_label_popup, lv_color_white(), 0);
+      lv_obj_set_style_border_opa(chart_label_popup, LV_OPA_50, 0);
+      lv_obj_add_flag(chart_label_popup, LV_OBJ_FLAG_FLOATING);
+    }
+    
+    // Format the label text
+    static char buf[64];
+    if (timestamp > 0 && timestamp >= 1000000000) {
+      struct tm timeinfo_buf;
+      struct tm* timeinfo = localtime_r(&timestamp, &timeinfo_buf);
+      
+      if (timeinfo != NULL) {
+        int hour = timeinfo->tm_hour;
+        int min = timeinfo->tm_min;
+        const char* ampm = (hour >= 12) ? "PM" : "AM";
+        if (hour > 12) hour -= 12;
+        else if (hour == 0) hour = 12;
+        snprintf(buf, sizeof(buf), "%.2f%s\n%d:%02d %s", value, unit, hour, min, ampm);
+      } else {
+        snprintf(buf, sizeof(buf), "%.2f%s", value, unit);
+      }
+    } else {
+      snprintf(buf, sizeof(buf), "%.2f%s", value, unit);
+    }
+    
+    lv_label_set_text(chart_label_popup, buf);
+    
+    // Get point position on chart
+    lv_chart_series_t * ser = lv_chart_get_series_next(chart, NULL);
+    if(ser == NULL) {
+      return;
+    }
+    
+    lv_point_t p;
+    lv_chart_get_point_pos_by_id(chart, ser, id, &p);
+    
+    lv_area_t chart_coords;
+    lv_obj_get_coords(chart, &chart_coords);
+    
+    // Position label above the data point
+    lv_coord_t label_x = chart_coords.x1 + p.x;
+    lv_coord_t label_y = chart_coords.y1 + p.y - 45;
+    
+    lv_obj_update_layout(chart_label_popup);
+    lv_coord_t label_width = lv_obj_get_width(chart_label_popup);
+    
+    lv_obj_set_pos(chart_label_popup, label_x - (label_width / 2), label_y);
+    lv_obj_clear_flag(chart_label_popup, LV_OBJ_FLAG_HIDDEN);
+  }
+  else if(code == LV_EVENT_RELEASED) {
+    if(chart_label_popup != NULL) {
+      lv_obj_add_flag(chart_label_popup, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+  else if(code == LV_EVENT_VALUE_CHANGED) {
+    lv_obj_invalidate(chart);
+  }
+}
+
 
 static void temp_chart_draw_label_cb(lv_event_t * e) {
   lv_event_code_t code = lv_event_get_code(e);
@@ -395,14 +887,15 @@ static void temp_chart_draw_label_cb(lv_event_t * e) {
   if(code == LV_EVENT_PRESSED || code == LV_EVENT_PRESSING) {
     int32_t id = lv_chart_get_pressed_point(chart);
     
-    if(id == LV_CHART_POINT_NONE) {
+    if(id == LV_CHART_POINT_NONE || tempHistory == nullptr || tempHistoryCount == 0 || temp_chart == NULL) {
       if(temp_label_popup != NULL) {
         lv_obj_add_flag(temp_label_popup, LV_OBJ_FLAG_HIDDEN);
       }
       return;
     }
     
-    int chartPoints = lv_chart_get_point_count(chart);
+    int chartPoints = lv_chart_get_point_count(temp_chart);
+    
     if (id < 0 || id >= chartPoints) {
       if(temp_label_popup != NULL) {
         lv_obj_add_flag(temp_label_popup, LV_OBJ_FLAG_HIDDEN);
@@ -410,9 +903,61 @@ static void temp_chart_draw_label_cb(lv_event_t * e) {
       return;
     }
     
-    // Create label popup if needed
+    int expectedPoints = tempHistoryCount;
+    if (expectedPoints > 100) expectedPoints = 100;
+    if (expectedPoints < 2) expectedPoints = 2;
+    
+    if (chartPoints != expectedPoints) {
+      if(temp_label_popup != NULL) {
+        lv_obj_add_flag(temp_label_popup, LV_OBJ_FLAG_HIDDEN);
+      }
+      return;
+    }
+    
+    int startIdx = (tempHistoryIndex - tempHistoryCount + tempHistoryCapacity) % tempHistoryCapacity;
+    int historyIdx;
+    
+    if (tempHistoryCount <= chartPoints) {
+      historyIdx = id;
+    } else {
+      if (chartPoints <= 1) {
+        historyIdx = 0;
+      } else {
+        historyIdx = (id * (tempHistoryCount - 1)) / (chartPoints - 1);
+      }
+    }
+    
+    if (historyIdx < 0 || historyIdx >= tempHistoryCount) {
+      if(temp_label_popup != NULL) {
+        lv_obj_add_flag(temp_label_popup, LV_OBJ_FLAG_HIDDEN);
+      }
+      return;
+    }
+    
+    int idx = (startIdx + historyIdx) % tempHistoryCapacity;
+    
+    if (idx < 0 || idx >= tempHistoryCapacity) {
+      if(temp_label_popup != NULL) {
+        lv_obj_add_flag(temp_label_popup, LV_OBJ_FLAG_HIDDEN);
+      }
+      return;
+    }
+    
+    if (tempHistory[idx].timestamp == 0) {
+      if(temp_label_popup != NULL) {
+        lv_obj_add_flag(temp_label_popup, LV_OBJ_FLAG_HIDDEN);
+      }
+      return;
+    }
+    
+    float temp_value = tempHistory[idx].temp;
+    time_t timestamp = (time_t)tempHistory[idx].timestamp;
+    
     if(temp_label_popup == NULL) {
       temp_label_popup = lv_label_create(lv_scr_act());
+      if (temp_label_popup == NULL) {
+        return;
+      }
       lv_obj_set_style_bg_color(temp_label_popup, lv_color_black(), 0);
       lv_obj_set_style_bg_opa(temp_label_popup, LV_OPA_80, 0);
       lv_obj_set_style_text_color(temp_label_popup, lv_color_white(), 0);
@@ -424,37 +969,10 @@ static void temp_chart_draw_label_cb(lv_event_t * e) {
       lv_obj_add_flag(temp_label_popup, LV_OBJ_FLAG_FLOATING);
     }
     
-    // Get time range for this point
-    time_t earliest_time = UINT32_MAX;
-    time_t latest_time = 0;
-    
-    for (int s = 0; s < NUM_TEMP_SENSORS; s++) {
-      if (sensorHistory[s] == nullptr || sensorHistoryCount[s] == 0) continue;
-      
-      int startIdx = (sensorHistoryIndex[s] - sensorHistoryCount[s] + TEMP_HISTORY_SIZE) % TEMP_HISTORY_SIZE;
-      int endIdx = (sensorHistoryIndex[s] - 1 + TEMP_HISTORY_SIZE) % TEMP_HISTORY_SIZE;
-      
-      time_t first = sensorHistory[s][startIdx].timestamp;
-      time_t last = sensorHistory[s][endIdx].timestamp;
-      
-      if (first > 0 && first < earliest_time) earliest_time = first;
-      if (last > latest_time) latest_time = last;
-    }
-    
-    time_t time_span = latest_time - earliest_time;
-    if (time_span <= 0) time_span = 60;
-    
-    // Calculate timestamp for this chart point
-    time_t point_time = earliest_time + ((time_span * id) / (chartPoints - 1));
-    
-    // Find data from each sensor near this timestamp (within ±30 seconds for minute normalization)
-    static char buf[256];
-    char time_str[32] = "";
-    int line_count = 0;
-    
-    if (point_time > 0 && point_time >= 1000000000) {
+    static char buf[64];
+    if (timestamp > 0 && timestamp >= 1000000000) {
       struct tm timeinfo_buf;
-      struct tm* timeinfo = localtime_r(&point_time, &timeinfo_buf);
+      struct tm* timeinfo = localtime_r(&timestamp, &timeinfo_buf);
       
       if (timeinfo != NULL) {
         int hour = timeinfo->tm_hour;
@@ -462,76 +980,35 @@ static void temp_chart_draw_label_cb(lv_event_t * e) {
         const char* ampm = (hour >= 12) ? "PM" : "AM";
         if (hour > 12) hour -= 12;
         else if (hour == 0) hour = 12;
-        snprintf(time_str, sizeof(time_str), "%d:%02d %s", hour, min, ampm);
+        snprintf(buf, sizeof(buf), "%.2f°C\n%d:%02d %s", temp_value, hour, min, ampm);
+      } else {
+        snprintf(buf, sizeof(buf), "%.2f°C", temp_value);
       }
-    }
-    
-    buf[0] = '\0';  // Clear buffer
-    
-    // Check each sensor for data at this time
-    for (int s = 0; s < NUM_TEMP_SENSORS; s++) {
-      if (!seriesVisible[s] || sensorHistory[s] == nullptr || sensorHistoryCount[s] == 0) {
-        continue;
-      }
-      
-      // Find closest data point within ±30 seconds
-      int startIdx = (sensorHistoryIndex[s] - sensorHistoryCount[s] + TEMP_HISTORY_SIZE) % TEMP_HISTORY_SIZE;
-      float closest_temp = -999.0;
-      time_t closest_time_diff = UINT32_MAX;
-      
-      for (int i = 0; i < sensorHistoryCount[s]; i++) {
-        int idx = (startIdx + i) % TEMP_HISTORY_SIZE;
-        time_t ts = sensorHistory[s][idx].timestamp;
-        time_t diff = (ts > point_time) ? (ts - point_time) : (point_time - ts);
-        
-        if (diff < closest_time_diff && diff <= 30) {  // Within 30 seconds
-          closest_time_diff = diff;
-          closest_temp = sensorHistory[s][idx].temp;
-        }
-      }
-      
-      if (closest_temp > -999.0) {
-        char line[64];
-        snprintf(line, sizeof(line), "%s: %.2f°C\n", sensorNames[s], closest_temp);
-        strcat(buf, line);
-        line_count++;
-      }
-    }
-    
-    if (line_count > 0) {
-      strcat(buf, time_str);
-      lv_label_set_text(temp_label_popup, buf);
-      
-      // Position label
-      lv_chart_series_t * ser = lv_chart_get_series_next(chart, NULL);
-      if(ser == NULL) return;
-      
-      lv_point_t p;
-      lv_chart_get_point_pos_by_id(chart, ser, id, &p);
-      
-      lv_area_t chart_coords;
-      lv_obj_get_coords(chart, &chart_coords);
-      
-      lv_obj_update_layout(temp_label_popup);
-      lv_coord_t label_width = lv_obj_get_width(temp_label_popup);
-      lv_coord_t label_height = lv_obj_get_height(temp_label_popup);
-      
-      int32_t label_x = chart_coords.x1 + p.x - (label_width / 2);
-      int32_t label_y = chart_coords.y1 + p.y - label_height - 10;
-      
-      int32_t screen_width = lv_obj_get_width(lv_scr_act());
-      int32_t screen_height = lv_obj_get_height(lv_scr_act());
-      
-      if (label_x < 0) label_x = 0;
-      if (label_x + label_width > screen_width) label_x = screen_width - label_width;
-      if (label_y < 0) label_y = 0;
-      if (label_y + label_height > screen_height) label_y = screen_height - label_height;
-      
-      lv_obj_set_pos(temp_label_popup, label_x, label_y);
-      lv_obj_clear_flag(temp_label_popup, LV_OBJ_FLAG_HIDDEN);
     } else {
-      lv_obj_add_flag(temp_label_popup, LV_OBJ_FLAG_HIDDEN);
+      snprintf(buf, sizeof(buf), "%.2f°C", temp_value);
     }
+    
+    lv_label_set_text(temp_label_popup, buf);
+    
+    lv_chart_series_t * ser = lv_chart_get_series_next(chart, NULL);
+    if(ser == NULL) {
+      return;
+    }
+    
+    lv_point_t p;
+    lv_chart_get_point_pos_by_id(chart, ser, id, &p);
+    
+    lv_area_t chart_coords;
+    lv_obj_get_coords(chart, &chart_coords);
+    
+    lv_coord_t label_x = chart_coords.x1 + p.x;
+    lv_coord_t label_y = chart_coords.y1 + p.y - 45;
+    
+    lv_obj_update_layout(temp_label_popup);
+    lv_coord_t label_width = lv_obj_get_width(temp_label_popup);
+    
+    lv_obj_set_pos(temp_label_popup, label_x - (label_width / 2), label_y);
+    lv_obj_clear_flag(temp_label_popup, LV_OBJ_FLAG_HIDDEN);
   }
   else if(code == LV_EVENT_RELEASED) {
     if(temp_label_popup != NULL) {
@@ -543,30 +1020,15 @@ static void temp_chart_draw_label_cb(lv_event_t * e) {
   }
 }
 
-
 float s2instwind = 999;
-
 float s2temp, s2windgust, s2avgwind, s2winddirV;
 unsigned long s2LastUpdate = 0;
 
+// Removed ESP-NOW queue and message handling - data now comes via UDP
 
-// Queue and message for ESP-NOW processing
-typedef struct {
-  uint8_t mac[6];
-  uint8_t payload[32];
-  int len;
-} EspNowMsg;
-
-static QueueHandle_t espNowQueue = NULL;
-volatile uint32_t sensor1MsgCount = 0;
-volatile uint32_t sensor2MsgCount = 0;
-volatile uint32_t espNowQueueDroppedCount = 0;
-
-
-
-float getWindDirection()
+float getWindDirection(u_int16_t adcValue)
 {
-    uint16_t rawADC = s0winddirV;
+    uint16_t rawADC = adcValue;
     int16_t closestDifference = 32767;
     uint8_t closestIndex = 0;
     for (uint8_t i = 0; i < WMK_NUM_ANGLES; i++)
@@ -590,164 +1052,56 @@ typedef struct {
   float volts0;
 } esp_now_payload_t;
 
-// Updated payload structures
 typedef struct {
-  uint8_t sensor_id;
-  float temp;
-  float hum;
-  float pres;
-  uint8_t magic[4];  // "TEMP"
-} temp_sensor_payload_t;
-
-typedef struct {
-  uint8_t sensor_id;
   float temp;
   float windgust;
   float avgwind;
   float instwind;
   float winddirV;
-  float pres;
-  float hum;
-  uint8_t magic[4];  // "WIND"
 } esp_now_payload_wind_t;
-
-time_t normalizeToMinute(time_t timestamp);
-
-time_t normalizeToMinute(time_t timestamp) {
-  return (timestamp / 60) * 60;  // Round down to nearest minute
-}
 
 float s1temp = 999;
 float s1hum, s1pres, s1vBat;
 
-
-void handleUDPData();
-
-// Updated handleUDPData function
-void handleUDPData() {
-  int packetSize = udp.parsePacket();
-  if (packetSize) {
-    uint8_t buffer[256];
-    int len = udp.read(buffer, sizeof(buffer));
-    
-    // Check for wind sensor data
-    if (len == sizeof(esp_now_payload_wind_t)) {
-      esp_now_payload_wind_t payload;
-      memcpy(&payload, buffer, sizeof(payload));
-      
-      // Verify magic bytes for wind data
-      if (payload.magic[0] == 0x57 && payload.magic[1] == 0x49 &&
-          payload.magic[2] == 0x4E && payload.magic[3] == 0x44) {
-        
-        s0LastUpdate = millis();
-        s0temp = payload.temp;
-        s0hum = payload.hum;
-        s0pres = payload.pres;
-        s0windgust = payload.windgust;
-        s0avgwind = payload.avgwind;
-        s0instwind = payload.instwind;
-        s0winddirV = payload.winddirV;
-        
-        float windDir = getWindDirection();
-        addWindData(s0avgwind, windDir);
-        addTempToHistory(payload.temp, payload.hum, payload.pres, 3);
-        Serial.printf("Wind Sensor: temp=%.1f, wind=%.1f, dir=%.1f°\n", 
-                      s0temp, s0avgwind, windDir);
-      }
-    }
-    // Check for temperature sensor data
-    else if (len == sizeof(temp_sensor_payload_t)) {
-      temp_sensor_payload_t payload;
-      memcpy(&payload, buffer, sizeof(payload));
-      
-      // Verify magic bytes for temp data
-      if (payload.magic[0] == 0x54 && payload.magic[1] == 0x45 &&
-          payload.magic[2] == 0x4D && payload.magic[3] == 0x50) {
-        
-        int sensorId = payload.sensor_id - 1;  // Convert 1-4 to 0-3
-        
-        if (sensorId >= 0 && sensorId < NUM_TEMP_SENSORS) {
-          sensorLastUpdate[sensorId] = millis();
-          sensorTemps[sensorId] = payload.temp;
-          
-          addTempToHistory(payload.temp, payload.hum, payload.pres, sensorId);
-          
-          Serial.printf("Sensor %d: temp=%.2f°C, hum=%.2f%%, pres=%.2fhPa\n",
-                        payload.sensor_id, payload.temp, payload.hum, payload.pres);
-        }
-      }
-    }
-    // Check for slider values
-    else if (len == sizeof(slider_values_t)) {
-      slider_values_t sliders;
-      memcpy(&sliders, buffer, sizeof(sliders));
-      
-      if (sliders.magic[0] == 0xAB && sliders.magic[1] == 0xCD &&
-          sliders.magic[2] == 0xEF && sliders.magic[3] == 0x12) {
-        // Handle slider values if needed
-      }
-    }
-  }
-}
+// Data now received via UDP, not ESP-NOW
 
 #define every(interval) \
     static uint32_t __every__##interval = millis(); \
     if (millis() - __every__##interval >= interval && (__every__##interval = millis()))
 
-
-void addWindData(float speed, float direction) {
-    if (windHistory == nullptr) return;
     
-    // Add to circular buffer with timestamp
-    windHistory[windHistoryIndex].speed = speed;
+// Update addWindData function signature and implementation
+void addWindData(float speed, float direction, float gust) {
+    if (windHistory == nullptr) return;
+
+    // Apply wind offset multiplier
+    float adjSpeed = speed * windOffsetPercent;
+    float adjGust  = gust  * windOffsetPercent;
+
+    windHistory[windHistoryIndex].speed     = adjSpeed;
+    windHistory[windHistoryIndex].gust      = adjGust;
     windHistory[windHistoryIndex].direction = direction;
     windHistory[windHistoryIndex].timestamp = millis();
-    
+
     windHistoryIndex = (windHistoryIndex + 1) % windHistoryCapacity;
-    if (windHistoryCount < windHistoryCapacity) {
-        windHistoryCount++;
-    }
-    
-    // Find min/max in actual wind data
-    float minVal = 1000.0;
-    float maxVal = 0.0;
-    int startIdx = (windHistoryIndex - windHistoryCount + windHistoryCapacity) % windHistoryCapacity;
-    
-    for (int i = 0; i < windHistoryCount; i++) {
-        int idx = (startIdx + i) % windHistoryCapacity;
-        float val = windHistory[idx].speed;
-        if (val < minVal) minVal = val;
-        if (val > maxVal) maxVal = val;
-    }
-    
-    // Ensure minimum range
-    if (minVal > 0) minVal = 0.0;  // Wind speed starts at 0
-    float range = maxVal - minVal;
-    if (range < 10.0) range = 10.0;
-    
-    // Rebuild wind rose histogram
+    if (windHistoryCount < windHistoryCapacity) windHistoryCount++;
+
+    // Rebuild wind rose from history
     for (int i = 0; i < WIND_DIRECTIONS; i++) {
-        if (windRoseData[i] != nullptr) {
-            for (int j = 0; j < WIND_SPEED_BINS; j++) {
+        if (windRoseData[i] != nullptr)
+            for (int j = 0; j < WIND_SPEED_BINS; j++)
                 windRoseData[i][j] = 0;
-            }
-        }
     }
-    
+
+    int startIdx = (windHistoryIndex - windHistoryCount + windHistoryCapacity) % windHistoryCapacity;
     for (int i = 0; i < windHistoryCount; i++) {
-        int idx = (startIdx + i) % windHistoryCapacity;
-        float spd = windHistory[idx].speed;
+        int idx   = (startIdx + i) % windHistoryCapacity;
+        float spd = windHistory[idx].gust;
         float dir = windHistory[idx].direction;
-        int dirBin = (int)((dir + 11.25) / 22.5) % WIND_DIRECTIONS;
-        int spdBin;
-        if (spd < 8) spdBin = 0;
-        else if (spd < 16) spdBin = 1;
-        else if (spd < 24) spdBin = 2;
-        else if (spd < 32) spdBin = 3;
-        else spdBin = 4;
-        if (windRoseData[dirBin] != nullptr) {
+        int dirBin = (int)((dir + 11.25f) / 22.5f) % WIND_DIRECTIONS;
+        int spdBin = (spd < 5) ? 0 : (spd < 10) ? 1 : (spd < 20) ? 2 : (spd < 30) ? 3 : 4;
+        if (windRoseData[dirBin] != nullptr)
             windRoseData[dirBin][spdBin]++;
-        }
     }
 }
 
@@ -779,336 +1133,842 @@ void setTimezone() {
   tzset();
 }
 
-// Add temperature data to history with minute normalization
-void addTempToHistory(float temp, float hum, float pres, int sensorId) {
-  if (sensorId < 0 || sensorId >= NUM_TEMP_SENSORS) return;
-  if (sensorHistory[sensorId] == nullptr) return;
+void addTempToHistory(float temp) {
+  if (tempHistory == nullptr) return;
   
   time_t now = time(nullptr);
-  time_t normalized = normalizeToMinute(now);
+  tempHistory[tempHistoryIndex].temp = temp;
+  tempHistory[tempHistoryIndex].timestamp = (unsigned long)now;
   
-  // Check if we already have data for this minute
-  int currentIdx = sensorHistoryIndex[sensorId];
-  int prevIdx = (currentIdx - 1 + TEMP_HISTORY_SIZE) % TEMP_HISTORY_SIZE;
-  
-  if (sensorHistoryCount[sensorId] > 0 && 
-      sensorHistory[sensorId][prevIdx].timestamp == normalized) {
-    // Update existing minute's data (average if desired, or just replace)
-    sensorHistory[sensorId][prevIdx].temp = temp;
-    sensorHistory[sensorId][prevIdx].hum = hum;
-    sensorHistory[sensorId][prevIdx].pres = pres;
-    return;
-  }
-  
-  // Add new entry
-  sensorHistory[sensorId][currentIdx].temp = temp;
-  sensorHistory[sensorId][currentIdx].hum = hum;
-  sensorHistory[sensorId][currentIdx].pres = pres;
-  sensorHistory[sensorId][currentIdx].timestamp = normalized;
-  
-  sensorHistoryIndex[sensorId] = (currentIdx + 1) % TEMP_HISTORY_SIZE;
-  if (sensorHistoryCount[sensorId] < TEMP_HISTORY_SIZE) {
-    sensorHistoryCount[sensorId]++;
+  tempHistoryIndex = (tempHistoryIndex + 1) % tempHistoryCapacity;
+  if (tempHistoryCount < tempHistoryCapacity) {
+    tempHistoryCount++;
   }
 }
-void drawTempGraph() {
-  if (ui_Chart1 == NULL) return;
-  
-  // Count total data points across all sensors
-  int totalPoints = 0;
-  for (int i = 0; i < NUM_TEMP_SENSORS; i++) {
-    if (sensorHistoryCount[i] > totalPoints) {
-      totalPoints = sensorHistoryCount[i];
+
+void addSensorReading(int sensor, float temp, float hum, float pres) {
+    if (sensor < 0 || sensor >= NUM_SENSORS) return;
+    if (sensorHistory[sensor] == nullptr) return;
+    
+    time_t now = time(nullptr);
+    sensorHistory[sensor][sensorHistoryIndex[sensor]].temp = temp;
+    sensorHistory[sensor][sensorHistoryIndex[sensor]].hum = hum;
+    sensorHistory[sensor][sensorHistoryIndex[sensor]].pres = pres;
+    sensorHistory[sensor][sensorHistoryIndex[sensor]].timestamp = (unsigned long)now;
+    
+    sensorHistoryIndex[sensor] = (sensorHistoryIndex[sensor] + 1) % sensorHistoryCapacity;
+    if (sensorHistoryCount[sensor] < sensorHistoryCapacity) {
+        sensorHistoryCount[sensor]++;
     }
-  }
-  
-  if (totalPoints == 0) return;
-  
-  // Initialize chart series on first call
-  if (temp_chart_series[0] == NULL) {
-    // Remove default series
-    lv_chart_remove_series(ui_Chart1, lv_chart_get_series_next(ui_Chart1, NULL));
+}
+
+void addTempToHistory(int deviceId, float temp, float hum, float pres) {
+    if (deviceId < 0 || deviceId >= NUM_SENSORS) return;
     
-    // Create series for each sensor
-    for (int i = 0; i < NUM_TEMP_SENSORS; i++) {
-      temp_chart_series[i] = lv_chart_add_series(ui_Chart1, sensorColors[i], LV_CHART_AXIS_PRIMARY_Y);
+    addSensorReading(deviceId, temp, hum, pres);
+    
+    // Also add to legacy temp history for backward compatibility
+    if (deviceId == 0) {
+        addTempToHistory(temp);
     }
-    
-    lv_chart_set_type(ui_Chart1, LV_CHART_TYPE_LINE);
-    lv_obj_set_style_line_width(ui_Chart1, 2, LV_PART_ITEMS);
-    lv_obj_set_style_size(ui_Chart1, 4, 4, LV_PART_INDICATOR);
-    
-    lv_obj_add_event_cb(ui_Chart1, temp_chart_draw_label_cb, LV_EVENT_ALL, NULL);
-    
-    lv_obj_t* parent = lv_obj_get_parent(ui_Chart1);
-    
-    // Create Y-axis scale
-    temp_scale_y = lv_scale_create(parent);
-    lv_obj_set_size(temp_scale_y, 38, lv_obj_get_height(ui_Chart1));
-    lv_obj_align_to(temp_scale_y, ui_Chart1, LV_ALIGN_OUT_LEFT_MID, -5, 0);
-    lv_scale_set_mode(temp_scale_y, LV_SCALE_MODE_VERTICAL_LEFT);
-    lv_scale_set_label_show(temp_scale_y, true);
-    lv_obj_set_style_length(temp_scale_y, 5, LV_PART_ITEMS);
-    lv_obj_set_style_length(temp_scale_y, 10, LV_PART_INDICATOR);
-    lv_obj_set_style_text_font(temp_scale_y, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_pad_all(temp_scale_y, 0, 0);
-    
-    // Create time labels
-    int chart_width = lv_obj_get_width(ui_Chart1);
-    int label_spacing = chart_width / 4;
-    
-    for (int i = 0; i < 5; i++) {
-      time_labels[i] = lv_label_create(parent);
-      lv_label_set_text(time_labels[i], "--:--");
-      lv_obj_set_style_text_font(time_labels[i], &lv_font_montserrat_8, 0);
-      int x_offset = (i * label_spacing) - (chart_width / 2);
-      lv_obj_align_to(time_labels[i], ui_Chart1, LV_ALIGN_OUT_BOTTOM_MID, x_offset, 5);
-    }
-    
-    // Create legend
-    createLegend();
-    
-    Serial.println("Chart initialized with 4 sensor series");
-  }
-  
-  // Determine display points (limit to reasonable amount)
-  int displayPoints = totalPoints;
-  if (displayPoints > 100) displayPoints = 100;
-  if (displayPoints < 2) displayPoints = 2;
-  
-  lv_chart_set_point_count(ui_Chart1, displayPoints);
-  
-  // Find global min/max temperature across all visible sensors
-  float minTemp = 999.0;
-  float maxTemp = -999.0;
-  
-  for (int s = 0; s < NUM_TEMP_SENSORS; s++) {
-    if (!seriesVisible[s] || sensorHistory[s] == nullptr || sensorHistoryCount[s] == 0) {
-      continue;
-    }
-    
-    int startIdx = (sensorHistoryIndex[s] - sensorHistoryCount[s] + TEMP_HISTORY_SIZE) % TEMP_HISTORY_SIZE;
-    for (int i = 0; i < sensorHistoryCount[s]; i++) {
-      int idx = (startIdx + i) % TEMP_HISTORY_SIZE;
-      float temp = sensorHistory[s][idx].temp;
-      if (temp < minTemp) minTemp = temp;
-      if (temp > maxTemp) maxTemp = temp;
-    }
-  }
-  
-  // Ensure minimum range
-  if (minTemp > maxTemp) {
-    minTemp = 20.0;
-    maxTemp = 25.0;
-  }
-  
-  float range = maxTemp - minTemp;
-  if (range < 5.0) {
-    float center = (minTemp + maxTemp) / 2.0;
-    minTemp = center - 2.5;
-    maxTemp = center + 2.5;
-  } else {
-    minTemp -= 1.0;
-    maxTemp += 1.0;
-  }
-  
-  // Get time range from all sensors
-  time_t earliest_time = UINT32_MAX;
-  time_t latest_time = 0;
-  
-  for (int s = 0; s < NUM_TEMP_SENSORS; s++) {
-    if (sensorHistory[s] == nullptr || sensorHistoryCount[s] == 0) continue;
-    
-    int startIdx = (sensorHistoryIndex[s] - sensorHistoryCount[s] + TEMP_HISTORY_SIZE) % TEMP_HISTORY_SIZE;
-    int endIdx = (sensorHistoryIndex[s] - 1 + TEMP_HISTORY_SIZE) % TEMP_HISTORY_SIZE;
-    
-    time_t first = sensorHistory[s][startIdx].timestamp;
-    time_t last = sensorHistory[s][endIdx].timestamp;
-    
-    if (first > 0 && first < earliest_time) earliest_time = first;
-    if (last > latest_time) latest_time = last;
-  }
-  
-  time_t time_span = latest_time - earliest_time;
-  if (time_span <= 0) time_span = 60;  // At least 1 minute
-  
-  // Clear all points
-  for (int s = 0; s < NUM_TEMP_SENSORS; s++) {
-    for (int i = 0; i < displayPoints; i++) {
-      lv_chart_set_value_by_id(ui_Chart1, temp_chart_series[s], i, LV_CHART_POINT_NONE);
-    }
-  }
-  
-  // Plot each sensor's data at time-proportional positions
-  for (int s = 0; s < NUM_TEMP_SENSORS; s++) {
-    if (!seriesVisible[s] || sensorHistory[s] == nullptr || sensorHistoryCount[s] == 0) {
-      continue;
-    }
-    
-    int startIdx = (sensorHistoryIndex[s] - sensorHistoryCount[s] + TEMP_HISTORY_SIZE) % TEMP_HISTORY_SIZE;
-    
-    for (int i = 0; i < sensorHistoryCount[s]; i++) {
-      int idx = (startIdx + i) % TEMP_HISTORY_SIZE;
-      time_t ts = sensorHistory[s][idx].timestamp;
-      float temp = sensorHistory[s][idx].temp;
-      
-      // Calculate X position based on time
-      int x_pos = 0;
-      if (time_span > 0) {
-        x_pos = ((ts - earliest_time) * (displayPoints - 1)) / time_span;
-      }
-      
-      if (x_pos >= 0 && x_pos < displayPoints) {
-        lv_chart_set_value_by_id(ui_Chart1, temp_chart_series[s], x_pos, (int32_t)(temp * 100));
-      }
-    }
-  }
-  
-  // Update Y-axis range
-  lv_chart_set_range(ui_Chart1, LV_CHART_AXIS_PRIMARY_Y, 
-                      (int32_t)(minTemp * 100), (int32_t)(maxTemp * 100));
-  
-  if (temp_scale_y != NULL) {
-    int totalTicks = (int)(maxTemp - minTemp) + 1;
-    lv_scale_set_total_tick_count(temp_scale_y, totalTicks);
-    if (totalTicks < 10) {
-      lv_scale_set_major_tick_every(temp_scale_y, 1);
-    } else {
-      lv_scale_set_major_tick_every(temp_scale_y, totalTicks / 5);
-    }
-    lv_scale_set_range(temp_scale_y, (int32_t)minTemp, (int32_t)maxTemp);
-  }
-  
-  // Update X-axis time labels
-  for (int i = 0; i < 5; i++) {
-    if (time_labels[i] == NULL) continue;
-    
-    time_t label_time = earliest_time + (time_span * i / 4);
-    
-    if (label_time > 0 && label_time >= 1000000000) {
-      struct tm timeinfo_buf;
-      struct tm* timeinfo = localtime_r(&label_time, &timeinfo_buf);
-      
-      if (timeinfo != NULL) {
-        int hour = timeinfo->tm_hour;
-        int min = timeinfo->tm_min;
-        const char* ampm = (hour >= 12) ? "PM" : "AM";
-        if (hour > 12) hour -= 12;
-        else if (hour == 0) hour = 12;
+}
+
+SensorReading* getLatestReading(int sensor) {
+    if (sensor < 0 || sensor >= NUM_SENSORS) return nullptr;
+    if (sensorHistory[sensor] == nullptr) return nullptr;
+    if (sensorHistoryCount[sensor] == 0) return nullptr;
+    int idx = (sensorHistoryIndex[sensor] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
+    return &sensorHistory[sensor][idx];
+}
+void cleanupChartContainers() ;
+
+void cleanupChartContainers() {
+    if (chart_container != NULL) {
+        Serial.println("Hiding chart containers (not deleting)");
         
-        char time_buf[16];
-        snprintf(time_buf, sizeof(time_buf), "%d:%02d%s", hour, min, ampm);
-        lv_label_set_text(time_labels[i], time_buf);
-      }
+        // Just hide them instead of deleting
+        lv_obj_add_flag(chart_container, LV_OBJ_FLAG_HIDDEN);
+        if (chart_x_axis_container != NULL) {
+            lv_obj_add_flag(chart_x_axis_container, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (chart_label_popup != NULL) {
+            lv_obj_add_flag(chart_label_popup, LV_OBJ_FLAG_HIDDEN);
+        }
+        
+        // DON'T delete, DON'T null the pointers
+        // Just mark for rebuild next time
+        lastChartUpdate = 0;
+        lastChartDataCount = -1;
+    }
+}
+
+
+void drawGenericChart() {
+    if (ui_Chart1 == NULL) {
+        Serial.println("ERROR: ui_Chart1 is NULL");
+        return;
+    }
+    
+    lv_obj_t * screen = lv_screen_active();
+    if (screen != ui_ScreenChart) {
+        return;
+    }
+    
+    // Add event callback for tooltips on first call
+    static bool event_added = false;
+    if (!event_added) {
+        lv_obj_add_event_cb(ui_Chart1, chart_draw_label_cb, LV_EVENT_ALL, NULL);
+        event_added = true;
+    }
+    
+    // Check if we need to redraw
+    int currentDataCount = 0;
+    if (currentChart.dataType == CHART_WIND_SPEED) {
+        currentDataCount = windHistoryCount;
+    } else {
+        int sensor = currentChart.sensorIndex;
+        if (sensor >= 0 && sensor < NUM_SENSORS) {
+            currentDataCount = sensorHistoryCount[sensor];
+        }
+    }
+    
+    bool needsRedraw = false;
+    bool needsFullRebuild = false;
+    
+    if (chart_container == NULL) {
+        needsRedraw = true;
+        needsFullRebuild = true;
+        Serial.println("First draw - creating containers");
+        lastChartType = currentChart.dataType;
+        lastChartSensor = currentChart.sensorIndex;
+    }
+    else if (lastChartType != currentChart.dataType || lastChartSensor != currentChart.sensorIndex) {
+        needsRedraw = true;
+        needsFullRebuild = true;
+        Serial.println("Chart type/sensor changed - full rebuild");
+        lastChartType = currentChart.dataType;
+        lastChartSensor = currentChart.sensorIndex;
+    }
+    else if (lastChartDataCount != currentDataCount) {
+        needsRedraw = true;
+        Serial.printf("Data count changed: %d -> %d\n", lastChartDataCount, currentDataCount);
+    }
+    else if (millis() - lastChartUpdate > 5000) {
+        needsRedraw = true;
+        Serial.println("Periodic update (5s)");
+    }
+    
+    if (!needsRedraw) {
+        return;
+    }
+    
+    lastChartUpdate = millis();
+    lastChartDataCount = currentDataCount;
+    
+    Serial.printf("Drawing chart: type=%d, sensor=%d\n", currentChart.dataType, currentChart.sensorIndex);
+    
+    // Clean up containers if rebuilding
+    if (needsFullRebuild && chart_container != NULL) {
+        Serial.println("Deleting old containers for rebuild");
+        lv_obj_del(chart_container);
+        chart_container = NULL;
+        chart_scale_y = NULL;
+        chart_x_axis_container = NULL;
+        
+        // CRITICAL: Give LVGL time to process deletions
+        for (int i = 0; i < 3; i++) {
+            lv_timer_handler();
+            delay(10);
+        }
+    }
+    
+    // Create containers if needed
+    if (chart_container == NULL) {
+        Serial.println("Creating chart scale containers");
+        
+        lv_obj_update_layout(screen);
+        lv_obj_update_layout(ui_Chart1);
+        
+        lv_area_t chart_area;
+        lv_obj_get_coords(ui_Chart1, &chart_area);
+        
+        lv_coord_t chart_x = chart_area.x1;
+        lv_coord_t chart_y = chart_area.y1;
+        lv_coord_t chart_w = lv_area_get_width(&chart_area);
+        lv_coord_t chart_h = lv_area_get_height(&chart_area);
+        
+        Serial.printf("Chart position: x=%d, y=%d, w=%d, h=%d\n", chart_x, chart_y, chart_w, chart_h);
+        
+        if (chart_w <= 0 || chart_h <= 0 || chart_w < 100 || chart_h < 100) {
+            Serial.println("ERROR: Chart has invalid size - skipping");
+            return;
+        }
+        
+        chart_container = lv_obj_create(screen);
+        lv_obj_set_size(chart_container, 50, chart_h);
+        lv_obj_set_pos(chart_container, chart_x - 55, chart_y);
+        lv_obj_clear_flag(chart_container, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_pad_all(chart_container, 0, 0);
+        lv_obj_set_style_border_width(chart_container, 0, 0);
+        lv_obj_set_style_bg_opa(chart_container, LV_OPA_TRANSP, 0);
+        lv_obj_move_foreground(chart_container);
+        
+        chart_scale_y = lv_scale_create(chart_container);
+        lv_obj_set_size(chart_scale_y, 50, chart_h);
+        lv_obj_align(chart_scale_y, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_scale_set_mode(chart_scale_y, LV_SCALE_MODE_VERTICAL_LEFT);
+        lv_scale_set_label_show(chart_scale_y, true);
+        lv_obj_set_style_length(chart_scale_y, 5, LV_PART_ITEMS);
+        lv_obj_set_style_length(chart_scale_y, 10, LV_PART_INDICATOR);
+        lv_obj_set_style_text_font(chart_scale_y, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(chart_scale_y, lv_color_white(), LV_PART_MAIN);
+        lv_obj_set_style_text_color(chart_scale_y, lv_color_white(), LV_PART_INDICATOR);
+        lv_obj_set_style_text_color(chart_scale_y, lv_color_white(), LV_PART_ITEMS);
+        lv_obj_set_style_pad_all(chart_scale_y, 0, 0);
+        
+        chart_x_axis_container = lv_obj_create(screen);
+        lv_obj_set_size(chart_x_axis_container, chart_w, 25);
+        lv_obj_set_pos(chart_x_axis_container, chart_x, chart_y + chart_h + 5);
+        lv_obj_set_flex_flow(chart_x_axis_container, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(chart_x_axis_container, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(chart_x_axis_container, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_pad_all(chart_x_axis_container, 0, 0);
+        lv_obj_set_style_pad_left(chart_x_axis_container, 3, 0);
+        lv_obj_set_style_pad_right(chart_x_axis_container, 3, 0);
+        lv_obj_set_style_border_width(chart_x_axis_container, 0, 0);
+        lv_obj_set_style_bg_opa(chart_x_axis_container, LV_OPA_TRANSP, 0);
+        lv_obj_move_foreground(chart_x_axis_container);
+        
+        for (int i = 0; i < 5; i++) {
+            lv_obj_t * time_label = lv_label_create(chart_x_axis_container);
+            lv_label_set_text(time_label, "--:--");
+            lv_obj_set_style_text_font(time_label, &lv_font_montserrat_8, 0);
+            lv_obj_set_style_text_color(time_label, lv_color_white(), 0);
+            lv_obj_set_style_pad_all(time_label, 0, 0);
+        }
+        
+        Serial.println("Containers created");
+    } else {
+    // Containers exist but might be hidden - show them
+    Serial.println("Showing existing containers");
+    lv_obj_clear_flag(chart_container, LV_OBJ_FLAG_HIDDEN);
+    if (chart_x_axis_container != NULL) {
+        lv_obj_clear_flag(chart_x_axis_container, LV_OBJ_FLAG_HIDDEN);
     }
   }
-  
-  lv_chart_refresh(ui_Chart1);
+    
+    // Only remove series if chart type or sensor changed
+    static bool seriesInitialized = false;
+    if (needsFullRebuild) {
+        Serial.println("Removing old series");
+        lv_chart_series_t * ser;
+        while ((ser = lv_chart_get_series_next(ui_Chart1, NULL)) != NULL) {
+            lv_chart_remove_series(ui_Chart1, ser);
+        }
+        seriesInitialized = false;
+    }
+    
+    // === WIND SPEED CHART ===
+    if (currentChart.dataType == CHART_WIND_SPEED) {
+        if (windHistory == nullptr || windHistoryCount == 0) {
+            Serial.println("No wind history data available");
+            lv_label_set_text(ui_LabelChart, "Wind Speed & Gusts - No Data");
+            return;
+        }
+        
+        lv_label_set_text(ui_LabelChart, "Wind Speed & Gusts");
+        
+        int displayPoints = windHistoryCount;
+        if (displayPoints > 100) displayPoints = 100;
+        if (displayPoints < 2) displayPoints = 2;
+        
+        Serial.printf("Wind chart: displayPoints=%d, historyCount=%d\n", displayPoints, windHistoryCount);
+        
+        lv_chart_set_point_count(ui_Chart1, displayPoints);
+        
+        float minVal = 999.0;
+        float maxVal = -999.0;
+        int startIdx = (windHistoryIndex - windHistoryCount + windHistoryCapacity) % windHistoryCapacity;
+        
+        for (int i = 0; i < windHistoryCount; i++) {
+            int idx = (startIdx + i) % windHistoryCapacity;
+            float speedVal = windHistory[idx].speed;
+            float gustVal = windHistory[idx].gust;
+            if (speedVal < minVal) minVal = speedVal;
+            if (speedVal > maxVal) maxVal = speedVal;
+            if (gustVal < minVal) minVal = gustVal;
+            if (gustVal > maxVal) maxVal = gustVal;
+        }
+        
+        if (minVal > 0) minVal = 0.0;
+        float range = maxVal - minVal;
+        if (range < 10.0) {
+            maxVal = 10.0;
+        } else {
+            maxVal += 2.0;
+        }
+        
+        Serial.printf("Wind range: %.1f to %.1f\n", minVal, maxVal);
+        
+        lv_chart_series_t * speed_series = lv_chart_get_series_next(ui_Chart1, NULL);
+        lv_chart_series_t * gust_series = NULL;
+        
+        if (!seriesInitialized) {
+            Serial.println("Creating wind series");
+            speed_series = lv_chart_add_series(ui_Chart1, lv_palette_main(LV_PALETTE_GREEN), LV_CHART_AXIS_PRIMARY_Y);
+            gust_series = lv_chart_add_series(ui_Chart1, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
+            seriesInitialized = true;
+        } else {
+            gust_series = lv_chart_get_series_next(ui_Chart1, speed_series);
+        }
+        
+        if (speed_series == NULL || gust_series == NULL) {
+            Serial.println("ERROR: Failed to get/create series");
+            return;
+        }
+        
+        Serial.println("Populating wind data...");
+        for (int i = 0; i < displayPoints; i++) {
+            int historyIdx;
+            if (windHistoryCount <= displayPoints) {
+                historyIdx = i;
+            } else {
+                historyIdx = (displayPoints <= 1) ? 0 : (i * (windHistoryCount - 1)) / (displayPoints - 1);
+            }
+            
+            if (historyIdx < windHistoryCount) {
+                int idx = (startIdx + historyIdx) % windHistoryCapacity;
+                
+                float speedVal = windHistory[idx].speed;
+                int32_t speed_chart_value = (int32_t)(speedVal * 100);
+                lv_chart_set_value_by_id(ui_Chart1, speed_series, i, speed_chart_value);
+                
+                float gustVal = windHistory[idx].gust;
+                int32_t gust_chart_value = (int32_t)(gustVal * 100);
+                lv_chart_set_value_by_id(ui_Chart1, gust_series, i, gust_chart_value);
+            } else {
+                lv_chart_set_value_by_id(ui_Chart1, speed_series, i, LV_CHART_POINT_NONE);
+                lv_chart_set_value_by_id(ui_Chart1, gust_series, i, LV_CHART_POINT_NONE);
+            }
+        }
+        
+        lv_chart_set_range(ui_Chart1, LV_CHART_AXIS_PRIMARY_Y, (int32_t)(minVal * 100), (int32_t)(maxVal * 100));
+        
+        if (chart_scale_y != NULL) {
+            int totalTicks = (int)(maxVal - minVal) + 1;
+            if (totalTicks < 2) totalTicks = 2;
+            lv_scale_set_total_tick_count(chart_scale_y, totalTicks);
+            if (totalTicks < 10) {
+                lv_scale_set_major_tick_every(chart_scale_y, 1);
+            } else {
+                lv_scale_set_major_tick_every(chart_scale_y, totalTicks / 5);
+            }
+            lv_scale_set_range(chart_scale_y, (int32_t)minVal, (int32_t)maxVal);
+            lv_scale_set_label_show(chart_scale_y, true);
+        }
+        
+        if (chart_x_axis_container != NULL && windHistoryCount > 0) {
+            int numLabels = lv_obj_get_child_count(chart_x_axis_container);
+            
+            for (int i = 0; i < numLabels; i++) {
+                lv_obj_t * time_label = lv_obj_get_child(chart_x_axis_container, i);
+                // CLEAR FIRST to prevent blur
+                lv_label_set_text(time_label, "");
+                int dataPoint;
+                if (numLabels <= 1) {
+                    dataPoint = 0;
+                } else {
+                    dataPoint = (i * (windHistoryCount - 1)) / (numLabels - 1);
+                }
+                
+                if (dataPoint < windHistoryCount) {
+                    int idx = (startIdx + dataPoint) % windHistoryCapacity;
+                    
+                    if (idx >= 0 && idx < windHistoryCapacity) {
+                        time_t timestamp = (time_t)(windHistory[idx].timestamp / 1000);
+                        
+                        if (timestamp > 0 && timestamp >= 1000000000) {
+                            struct tm timeinfo_buf;
+                            struct tm* timeinfo = localtime_r(&timestamp, &timeinfo_buf);
+                            
+                            if (timeinfo != NULL) {
+                                int hour = timeinfo->tm_hour;
+                                int min = timeinfo->tm_min;
+                                const char* ampm = (hour >= 12) ? "PM" : "AM";
+                                if (hour > 12) hour -= 12;
+                                else if (hour == 0) hour = 12;
+                                
+                                char time_buf[16];
+                                snprintf(time_buf, sizeof(time_buf), "%d:%02d%s", hour, min, ampm);
+                                lv_label_set_text(time_label, time_buf);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        lv_chart_refresh(ui_Chart1);
+        Serial.println("Wind chart complete");
+        return;
+    }
+    
+    // === SENSOR DATA CHART (temp/hum/pres) ===
+    int sensor = currentChart.sensorIndex;
+    if (sensor < 0 || sensor >= NUM_SENSORS || sensorHistory[sensor] == nullptr || sensorHistoryCount[sensor] == 0) {
+        char titleBuf[64];
+        snprintf(titleBuf, sizeof(titleBuf), "%s - Sensor %d - No Data", currentChart.title, sensor + 1);
+        lv_label_set_text(ui_LabelChart, titleBuf);
+        Serial.printf("No data for sensor %d\n", sensor);
+        return;
+    }
+    
+    char titleBuf[64];
+    snprintf(titleBuf, sizeof(titleBuf), "%s - Sensor %d", currentChart.title, sensor + 1);
+    lv_label_set_text(ui_LabelChart, titleBuf);
+    
+    int displayPoints = sensorHistoryCount[sensor];
+    if (displayPoints > 100) displayPoints = 100;
+    if (displayPoints < 2) displayPoints = 2;
+    
+    Serial.printf("Sensor %d chart: displayPoints=%d, historyCount=%d\n", sensor, displayPoints, sensorHistoryCount[sensor]);
+    
+    lv_chart_set_point_count(ui_Chart1, displayPoints);
+    
+    float minVal = 999.0;
+    float maxVal = -999.0;
+    int startIdx = (sensorHistoryIndex[sensor] - sensorHistoryCount[sensor] + sensorHistoryCapacity) % sensorHistoryCapacity;
+    
+    for (int i = 0; i < sensorHistoryCount[sensor]; i++) {
+        int idx = (startIdx + i) % sensorHistoryCapacity;
+        float val = 0;
+        
+        switch(currentChart.dataType) {
+            case CHART_TEMP: val = sensorHistory[sensor][idx].temp; break;
+            case CHART_HUM: val = sensorHistory[sensor][idx].hum; break;
+            case CHART_PRES: val = sensorHistory[sensor][idx].pres; break;
+            default: val = 0;
+        }
+        
+        if (val < minVal) minVal = val;
+        if (val > maxVal) maxVal = val;
+    }
+    
+    float range = maxVal - minVal;
+    if (range < 5.0) {
+        float center = (minVal + maxVal) / 2.0;
+        minVal = center - 2.5;
+        maxVal = center + 2.5;
+    } else {
+        minVal -= 1.0;
+        maxVal += 1.0;
+    }
+    
+    Serial.printf("Sensor range: %.1f to %.1f\n", minVal, maxVal);
+    
+    lv_chart_series_t * series = lv_chart_get_series_next(ui_Chart1, NULL);
+    if (!seriesInitialized) {
+        Serial.println("Creating sensor series");
+        series = lv_chart_add_series(ui_Chart1, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
+        seriesInitialized = true;
+    }
+    
+    if (series == NULL) {
+        Serial.println("ERROR: Failed to get/create series");
+        return;
+    }
+    
+    Serial.println("Populating sensor data...");
+    for (int i = 0; i < displayPoints; i++) {
+        int historyIdx;
+        if (sensorHistoryCount[sensor] <= displayPoints) {
+            historyIdx = i;
+        } else {
+            historyIdx = (displayPoints <= 1) ? 0 : (i * (sensorHistoryCount[sensor] - 1)) / (displayPoints - 1);
+        }
+        
+        if (historyIdx < sensorHistoryCount[sensor]) {
+            int idx = (startIdx + historyIdx) % sensorHistoryCapacity;
+            float val = 0;
+            
+            switch(currentChart.dataType) {
+                case CHART_TEMP: val = sensorHistory[sensor][idx].temp; break;
+                case CHART_HUM: val = sensorHistory[sensor][idx].hum; break;
+                case CHART_PRES: val = sensorHistory[sensor][idx].pres; break;
+                default: val = 0;
+            }
+            
+            int32_t chart_value = (int32_t)(val * 100);
+            lv_chart_set_value_by_id(ui_Chart1, series, i, chart_value);
+        } else {
+            lv_chart_set_value_by_id(ui_Chart1, series, i, LV_CHART_POINT_NONE);
+        }
+    }
+    
+    lv_chart_set_range(ui_Chart1, LV_CHART_AXIS_PRIMARY_Y, (int32_t)(minVal * 100), (int32_t)(maxVal * 100));
+    
+    if (chart_scale_y != NULL) {
+        int totalTicks = (int)(maxVal - minVal) + 1;
+        if (totalTicks < 2) totalTicks = 2;
+        lv_scale_set_total_tick_count(chart_scale_y, totalTicks);
+        if (totalTicks < 10) {
+            lv_scale_set_major_tick_every(chart_scale_y, 1);
+        } else {
+            lv_scale_set_major_tick_every(chart_scale_y, totalTicks / 5);
+        }
+        lv_scale_set_range(chart_scale_y, (int32_t)minVal, (int32_t)maxVal);
+        lv_scale_set_label_show(chart_scale_y, true);
+    }
+    
+    if (chart_x_axis_container != NULL && sensorHistoryCount[sensor] > 0) {
+        int numLabels = lv_obj_get_child_count(chart_x_axis_container);
+        
+        for (int i = 0; i < numLabels; i++) {
+            lv_obj_t * time_label = lv_obj_get_child(chart_x_axis_container, i);
+            // CLEAR FIRST to prevent blur
+            lv_label_set_text(time_label, "");
+            int dataPoint;
+            if (numLabels <= 1) {
+                dataPoint = 0;
+            } else {
+                dataPoint = (i * (sensorHistoryCount[sensor] - 1)) / (numLabels - 1);
+            }
+            
+            if (dataPoint < sensorHistoryCount[sensor]) {
+                int idx = (startIdx + dataPoint) % sensorHistoryCapacity;
+                
+                if (idx >= 0 && idx < sensorHistoryCapacity) {
+                    time_t timestamp = (time_t)sensorHistory[sensor][idx].timestamp;
+                    
+                    if (timestamp > 0 && timestamp >= 1000000000) {
+                        struct tm timeinfo_buf;
+                        struct tm* timeinfo = localtime_r(&timestamp, &timeinfo_buf);
+                        
+                        if (timeinfo != NULL) {
+                            int hour = timeinfo->tm_hour;
+                            int min = timeinfo->tm_min;
+                            const char* ampm = (hour >= 12) ? "PM" : "AM";
+                            if (hour > 12) hour -= 12;
+                            else if (hour == 0) hour = 12;
+                            
+                            char time_buf[16];
+                            snprintf(time_buf, sizeof(time_buf), "%d:%02d%s", hour, min, ampm);
+                            lv_label_set_text(time_label, time_buf);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    lv_chart_refresh(ui_Chart1);
+    Serial.println("Sensor chart complete");
 }
+
+// MODIFIED: New WiFi startup state machine to skip scanning if we have credentials
+void handleWifiStartup() {
+    unsigned long now = millis();
+    
+    switch (wifiStartupState) {
+        case WIFI_STARTUP_INIT:
+            Serial.println("=== WiFi Startup: Initializing ===");
+            
+            WiFi.mode(WIFI_AP_STA);
+            WiFi.setTxPower(WIFI_POWER_8_5dBm);
+            
+            // Initialize SNTP now that WiFi mode is set
+            if (!isSetNtp) {
+                initSNTP();
+                Serial.println("SNTP initialized");
+            }
+            
+            // Initialize ESP-NOW now that WiFi is initialized
+            if (esp_now_init() != ESP_OK) {
+                Serial.println("Error initializing ESP-NOW");
+            } else {
+                esp_now_register_recv_cb(onESPNowReceive);
+                Serial.println("ESP-NOW initialized");
+            }
+            
+            // Start UDP listener
+            udp.begin(UDP_PORT);
+            Serial.printf("UDP listener started on port %d\n", UDP_PORT);
+            
+            wifiStartupState = WIFI_STARTUP_CHECK_CREDS;  // Skip SCAN, go straight to credential check
+            wifiStartupStepTime = now;
+            break;
+            
+        case WIFI_STARTUP_SCAN:
+            // Wait a bit before scanning
+            if (now - wifiStartupStepTime < 500) break;
+            
+            Serial.println("=== WiFi Startup: Scanning networks ===");
+            consoleLog("Scanning for networks...");
+            lv_timer_handler();  // Update display
+            
+            populateWifiList();
+            
+            wifiStartupState = WIFI_STARTUP_COMPLETE;  // After scan, we're done
+            wifiStartupStepTime = now;
+            break;
+            
+        case WIFI_STARTUP_CHECK_CREDS:
+            // Wait a bit after init
+            if (now - wifiStartupStepTime < 500) break;
+            
+            Serial.println("=== WiFi Startup: Checking for saved credentials ===");
+            
+            // Check for saved credentials
+            if (loadWifiCredentials(startupSSID, startupPassword)) {
+                Serial.printf("Found saved credentials: SSID='%s'\n", startupSSID.c_str());
+                
+                consoleLog("Found saved credentials!");
+                lv_timer_handler();  // Update display
+                
+                char logBuf[128];
+                snprintf(logBuf, sizeof(logBuf), "SSID: %s", startupSSID.c_str());
+                consoleLog(logBuf);
+                lv_timer_handler();  // Update display
+                
+                consoleLog("Connecting to WiFi...");
+                lv_timer_handler();  // Update display
+                
+                delay(500);  // Brief pause so user can see the messages
+                
+                // Start connection attempt
+                Serial.printf("Starting WiFi.begin('%s', '***')\n", startupSSID.c_str());
+                WiFi.begin(startupSSID.c_str(), startupPassword.c_str());
+                wifiConnecting = true;
+                wifiConnectStartTime = now;
+                autoConnectMode = true;
+                
+                wifiStartupState = WIFI_STARTUP_CONNECTING;
+                wifiStartupStepTime = now;
+            } else {
+                Serial.println("No saved WiFi credentials found - will scan networks");
+                consoleLog("No saved credentials");
+                lv_timer_handler();
+                
+                // No credentials - scan networks now
+                wifiStartupState = WIFI_STARTUP_SCAN;
+                wifiStartupStepTime = now;
+            }
+            break;
+            
+        case WIFI_STARTUP_CONNECTING:
+            // checkWifiConnection() handles the actual connection monitoring
+            // We just need to detect when it's done
+            if (!wifiConnecting) {
+                // Connection attempt finished (success or failure)
+                if (WiFi.status() == WL_CONNECTED) {
+                    // Success - we're done
+                    wifiStartupState = WIFI_STARTUP_COMPLETE;
+                } else {
+                    // Failed - scan networks so user can try again
+                    Serial.println("Connection failed - scanning networks for manual selection");
+                    consoleLog("Connection failed");
+                    lv_timer_handler();
+                    wifiStartupState = WIFI_STARTUP_SCAN;
+                    wifiStartupStepTime = now;
+                }
+            }
+            break;
+            
+        case WIFI_STARTUP_COMPLETE:
+            // Nothing to do - startup complete
+            break;
+    }
+}
+
+// ============================================
+// UDP Packet Handler
+// ============================================
+
+// UDP packet structures matching the transmitters
+typedef struct {
+  uint8_t sensor_id;
+  float temp;
+  float hum;
+  float pres;
+  uint8_t magic[4];  // Magic bytes: 0x54, 0x45, 0x4D, 0x50 ("TEMP")
+} temp_sensor_payload_t;
+
+typedef struct {
+  uint8_t sensor_id;
+  float temp;
+  float windgust;
+  float avgwind;
+  float instwind;
+  float winddirV;
+  float pres;
+  float hum;
+  float avgWindow;      // ADD THIS
+  float gustWindow;     // ADD THIS
+  uint8_t magic[4];     // Magic bytes: 0x57, 0x49, 0x4E, 0x44 ("WIND")
+} wind_sensor_payload_t;
+
+// UPDATE the handleUDP() function's wind packet handler:
+void handleUDP() {
+    int packetSize = udp.parsePacket();
+    if (packetSize) {
+        uint8_t buffer[256];
+        int len = udp.read(buffer, sizeof(buffer));
+        
+        Serial.printf("UDP packet received: %d bytes\n", len);
+        
+        // Check for temperature sensor data
+        if (len == sizeof(temp_sensor_payload_t)) {
+            temp_sensor_payload_t payload;
+            memcpy(&payload, buffer, sizeof(payload));
+            
+            // Verify magic bytes for TEMP packet
+            if (payload.magic[0] == 0x54 && payload.magic[1] == 0x45 &&
+                payload.magic[2] == 0x4D && payload.magic[3] == 0x50) {
+                
+                // Check if sensor_id is valid
+                if (payload.sensor_id >= NUM_SENSORS) {
+                    Serial.printf("Invalid sensor_id: %d (max: %d)\n", payload.sensor_id, NUM_SENSORS - 1);
+                    return;
+                }
+                
+                // Check for duplicate within 2 seconds
+                unsigned long now = millis();
+                if ((now - lastTempMsgTime[payload.sensor_id]) < DUPLICATE_REJECT_MS) {
+                    Serial.printf("Duplicate TEMP packet from sensor %d rejected (%.1fs since last)\n", 
+                                  payload.sensor_id, 
+                                  (now - lastTempMsgTime[payload.sensor_id]) / 1000.0);
+                    return;
+                }
+                
+                // Update last message time
+                lastTempMsgTime[payload.sensor_id] = now;
+                
+                Serial.printf("Sensor %d: Temp=%.2f°C, Hum=%.1f%%, Pres=%.1fmbar\n", 
+                              payload.sensor_id, payload.temp, payload.hum, payload.pres);
+                
+                addTempToHistory(payload.sensor_id, payload.temp, payload.hum, payload.pres);
+            }
+        }
+        // Check for wind sensor data
+        else if (len == sizeof(wind_sensor_payload_t)) {
+            wind_sensor_payload_t payload;
+            memcpy(&payload, buffer, sizeof(payload));
+            
+            // Verify magic bytes for WIND packet
+            if (payload.magic[0] == 0x57 && payload.magic[1] == 0x49 &&
+                payload.magic[2] == 0x4E && payload.magic[3] == 0x44) {
+                
+                // Check for duplicate within 2 seconds
+                unsigned long now = millis();
+                if ((now - lastWindMsgTime) < DUPLICATE_REJECT_MS) {
+                    Serial.printf("Duplicate WIND packet rejected (%.1fs since last)\n", 
+                                  (now - lastWindMsgTime) / 1000.0);
+                    return;
+                }
+                
+                // Update last message time
+                lastWindMsgTime = now;
+                
+                Serial.printf("Wind Sensor: Speed=%.1fkph, Dir=%.1f, Gust=%.1fkph, AvgWin=%.1fs, GustWin=%.1fs\n", 
+                              payload.avgwind, payload.winddirV, payload.windgust, 
+                              payload.avgWindow, payload.gustWindow);
+                
+                s2windgust = payload.windgust;
+                
+                // UPDATE: Store the window settings from transmitter
+                currentAvgWindow = payload.avgWindow;
+                currentGustWindow = payload.gustWindow;
+                
+                // UPDATE: Update the spinbox values if we're on the settings screen
+                if (lv_screen_active() == ui_ScreenSettings) {
+                    if (ui_Spinbox1 != NULL && ui_Spinbox2 != NULL) {
+                        lv_spinbox_set_value(ui_Spinbox1, (int32_t)currentAvgWindow);
+                        lv_spinbox_set_value(ui_Spinbox2, (int32_t)currentGustWindow);
+                        Serial.printf("Updated spinboxes: Avg=%.1f, Gust=%.1f\n", 
+                                      currentAvgWindow, currentGustWindow);
+                    }
+                }
+                
+                // Add wind data WITH GUST parameter
+                addWindData(payload.avgwind, getWindDirection(payload.winddirV), payload.windgust);
+                
+                // Also store temp/hum/pres from wind sensor
+                if (payload.sensor_id < NUM_SENSORS) {
+                    // Use separate duplicate check for wind sensor temp data
+                    if ((now - lastTempMsgTime[payload.sensor_id]) >= DUPLICATE_REJECT_MS) {
+                        lastTempMsgTime[payload.sensor_id] = now;
+                        addTempToHistory(payload.sensor_id, payload.temp, payload.hum, payload.pres);
+                    } else {
+                        Serial.printf("Wind sensor temp data for sensor %d skipped (duplicate)\n", payload.sensor_id);
+                    }
+                }
+            }
+        } else {
+            Serial.printf("Unknown packet size: %d bytes\n", len);
+        }
+    }
+}
+
 void onESPNowReceive(const esp_now_recv_info_t * info, const uint8_t *data, int len)
 {
-  // Log EVERY message received
-  Serial.println("========================================");
-  Serial.printf("📨 ESP-NOW message received! Length: %d\n", len);
-  Serial.printf("From MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                info->src_addr[0], info->src_addr[1], info->src_addr[2],
-                info->src_addr[3], info->src_addr[4], info->src_addr[5]);
-  
-  // Print raw data
-  Serial.print("Raw data: ");
-  for (int i = 0; i < len && i < 32; i++) {
-    Serial.printf("%02X ", data[i]);
-  }
-  Serial.println();
-  
   // Check for credential request
   if (len == sizeof(credential_request_t)) {
-    Serial.printf("Length matches credential_request_t (%d bytes)\n", sizeof(credential_request_t));
-    
     credential_request_t request;
     memcpy(&request, data, sizeof(request));
-    
-    Serial.printf("Magic bytes: %02X %02X %02X %02X\n", 
-                  request.magic[0], request.magic[1], 
-                  request.magic[2], request.magic[3]);
     
     // Verify magic bytes
     if (request.magic[0] == 0xDE && request.magic[1] == 0xAD &&
         request.magic[2] == 0xBE && request.magic[3] == 0xEF) {
       
-      // Store requesting device MAC and set flag
-      memcpy(requestingDeviceMAC, info->src_addr, 6);
-      credentialRequestReceived = true;
+      Serial.println("Received credential request!");
       
-      Serial.println("✅ VALID Credential request received!");
-      Serial.printf("Will respond to: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                    requestingDeviceMAC[0], requestingDeviceMAC[1], requestingDeviceMAC[2],
-                    requestingDeviceMAC[3], requestingDeviceMAC[4], requestingDeviceMAC[5]);
-      Serial.println("========================================");
-      return;
-    } else {
-      Serial.println("❌ Invalid magic bytes for credential request");
+      // Get current WiFi credentials
+      String ssid = WiFi.SSID();
+      String password = WiFi.psk();
+      
+      if (ssid.length() > 0) {
+        wifi_credentials_t creds;
+        memset(&creds, 0, sizeof(creds));
+        strncpy(creds.ssid, ssid.c_str(), sizeof(creds.ssid) - 1);
+        strncpy(creds.password, password.c_str(), sizeof(creds.password) - 1);
+        creds.magic[0] = 0xCA;
+        creds.magic[1] = 0xFE;
+        creds.magic[2] = 0xBA;
+        creds.magic[3] = 0xBE;
+        
+        // Add peer if not exists - NO ENCRYPTION
+        uint8_t peerMAC[6];
+        memcpy(peerMAC, info->src_addr, 6);
+        
+        if (!esp_now_is_peer_exist(peerMAC)) {
+          esp_now_peer_info_t peerInfo = {};
+          memcpy(peerInfo.peer_addr, peerMAC, 6);
+          peerInfo.channel = 0;
+          peerInfo.encrypt = false;  // NO ENCRYPTION!
+          esp_now_add_peer(&peerInfo);
+        }
+        
+        // Send credentials unencrypted
+        esp_err_t result = esp_now_send(peerMAC, (uint8_t *)&creds, sizeof(creds));
+        
+        if (result == ESP_OK) {
+          Serial.printf("Sent credentials to sensor: %s\n", ssid.c_str());
+        } else {
+          Serial.printf("Failed to send credentials: %d\n", result);
+        }
+      } else {
+        Serial.println("No WiFi credentials to send");
+      }
     }
-  } else {
-    Serial.printf("Length mismatch - expected %d, got %d\n", sizeof(credential_request_t), len);
-  }
-  
-  Serial.println("========================================");
-  
-  // Original ESP-NOW message handling for sensor data
-  EspNowMsg msg;
-  memcpy(msg.mac, info->src_addr, 6);
-  msg.len = (len > (int)sizeof(msg.payload)) ? sizeof(msg.payload) : len;
-  memcpy(msg.payload, data, msg.len);
-  BaseType_t ok = pdFALSE;
-  if (espNowQueue != NULL) {
-    ok = xQueueSend(espNowQueue, &msg, 0);
-  }
-  if (ok != pdTRUE) {
-    espNowQueueDroppedCount++;
   }
 }
 
-
-void sendSliderValues();
-
-void sendSliderValues() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  
-  slider_values_t sliders;
-  sliders.sliderAvg = g_sliderAvgValue;
-  sliders.sliderGust = g_sliderGustValue;
-  sliders.magic[0] = 0xAB;
-  sliders.magic[1] = 0xCD;
-  sliders.magic[2] = 0xEF;
-  sliders.magic[3] = 0x12;
-  
-  // Broadcast to subnet
-  IPAddress broadcastIP = WiFi.localIP();
-  broadcastIP[3] = 255;
-  
-  udp.beginPacket(broadcastIP, UDP_PORT);
-  udp.write((uint8_t *)&sliders, sizeof(sliders));
-  udp.endPacket();
-  
-  Serial.printf("Sent slider values - Avg: %.1f, Gust: %.1f\n", g_sliderAvgValue, g_sliderGustValue);
-  
-  // Clear the flag
-  g_sliderValuesChanged = false;
-}
-
-
-
-// ---- LVGL Globals ----
 uint32_t screenWidth;
 uint32_t screenHeight;
 uint32_t bufSize;
 lv_display_t *disp;
 lv_color_t *disp_draw_buf;
 
-// -----------------------------------------------------------------------------
-//  LVGL Helper Functions
-// -----------------------------------------------------------------------------
 void my_print(lv_log_level_t level, const char *buf) {
     LV_UNUSED(level);
     Serial.println(buf);
@@ -1140,32 +2000,31 @@ void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
 void drawWindRose() {
     if (windHistory == nullptr || windHistoryCount == 0) return;
     
-    // Wind rose parameters - centered at x=169, y=196 on screen
     static lv_obj_t * wind_rose_canvas = NULL;
     static lv_draw_buf_t draw_buf;
     static bool buf_initialized = false;
     
     const int16_t canvasWidth = 180;
     const int16_t canvasHeight = 180;
-    const int16_t centerX = canvasWidth / 2;   // Center within canvas
+    const int16_t centerX = canvasWidth / 2;
     const int16_t centerY = canvasHeight / 2;
-    const int16_t maxRadius = 57;  // Maximum spoke length
-    
-    // Color mapping for speed bins
+    const int16_t maxRadius = 57;
+    int WINDROSECENTER_X = -55;
+    int WINDROSECENTER_Y = 0;
+    int DRAW_CENTER_X = 240 + WINDROSECENTER_X;
+    int DRAW_CENTER_Y = 136 + WINDROSECENTER_Y;
     lv_color_t speedColors[WIND_SPEED_BINS] = {
-        lv_color_hex(0x00FFFF),  // Cyan: 0-8 kph
-        lv_color_hex(0x00FF00),  // Green: 8-16 kph
-        lv_color_hex(0xFFFF00),  // Yellow: 16-24 kph
-        lv_color_hex(0xFF8800),  // Orange: 24-32 kph
-        lv_color_hex(0xFF0000)   // Red: >32 kph
+        lv_color_hex(0x00FFFF),
+        lv_color_hex(0x00FF00),
+        lv_color_hex(0xFFFF00),
+        lv_color_hex(0xFF8800),
+        lv_color_hex(0xFF0000)
     };
     
-    // Create canvas on first call
     if (wind_rose_canvas == NULL) {
         wind_rose_canvas = lv_canvas_create(lv_scr_act());
         
-        // Allocate and initialize draw buffer (ARGB8888 for transparency)
-        uint32_t buf_size = canvasWidth * canvasHeight * 4;  // 4 bytes per pixel
+        uint32_t buf_size = canvasWidth * canvasHeight * 4;
         void * buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (buf == NULL) {
             buf = malloc(buf_size);
@@ -1174,7 +2033,7 @@ void drawWindRose() {
         if (buf != NULL) {
             lv_draw_buf_init(&draw_buf, canvasWidth, canvasHeight, LV_COLOR_FORMAT_ARGB8888, 0, buf, buf_size);
             lv_canvas_set_draw_buf(wind_rose_canvas, &draw_buf);
-            lv_obj_set_pos(wind_rose_canvas, 172 - centerX, 196 - centerY);
+            lv_obj_set_pos(wind_rose_canvas, (DRAW_CENTER_X + 3) - centerX, DRAW_CENTER_Y - centerY);
             lv_obj_set_style_bg_opa(wind_rose_canvas, LV_OPA_TRANSP, 0);
             lv_obj_set_style_border_width(wind_rose_canvas, 0, 0);
             lv_obj_set_style_pad_all(wind_rose_canvas, 0, 0);
@@ -1187,10 +2046,8 @@ void drawWindRose() {
     
     if (!buf_initialized) return;
     
-    // Clear canvas with transparency
     lv_canvas_fill_bg(wind_rose_canvas, lv_color_black(), LV_OPA_TRANSP);
     
-    // Calculate total count per direction and max frequency
     int directionTotals[WIND_DIRECTIONS] = {0};
     int maxDirectionCount = 0;
     
@@ -1205,47 +2062,33 @@ void drawWindRose() {
         }
     }
     
-    if (maxDirectionCount == 0) return;  // No data to display
+    if (maxDirectionCount == 0) return;
     
-    // Initialize layer for drawing
     lv_layer_t layer;
     lv_canvas_init_layer(wind_rose_canvas, &layer);
     
-    // Draw wind rose spokes - each direction is a spoke broken into speed bands
     for (int dir = 0; dir < WIND_DIRECTIONS; dir++) {
         if (windRoseData[dir] == nullptr || directionTotals[dir] == 0) continue;
         
-        // Calculate spoke length based on frequency (proportional to max)
         float spokeLength = (float)directionTotals[dir] / (float)maxDirectionCount * maxRadius;
-        
-        // Calculate angle for this direction (dir 0 = N = 0°, clockwise)
-        // Subtract 90° to rotate the display so North points up
         float dirAngle = (dir * 22.5f) - 90.0f;
-        
-        // Draw speed bands from inside out
         float currentRadius = 0;
         
         for (int spd = 0; spd < WIND_SPEED_BINS; spd++) {
             int count = windRoseData[dir][spd];
             if (count == 0) continue;
             
-            // Calculate this band's contribution to the spoke length
             float bandLength = (float)count / (float)directionTotals[dir] * spokeLength;
             float innerRadius = currentRadius;
             float outerRadius = currentRadius + bandLength;
             
-            // Draw arc segment for this speed band
-            // Each spoke gets ~22.5° width (360/16)
             int16_t startAngle = (int16_t)(dirAngle - 11.25f);
             int16_t endAngle = (int16_t)(dirAngle + 11.25f);
             
-            // Normalize angles
             while (startAngle < 0) startAngle += 360;
             while (endAngle < 0) endAngle += 360;
             
-            // We need to draw the band as an arc segment
-            // Draw multiple arcs to fill the band from innerRadius to outerRadius
-            int numArcs = (int)(bandLength / 2) + 1;  // Number of arcs to fill the band
+            int numArcs = (int)(bandLength / 2) + 1;
             if (numArcs < 1) numArcs = 1;
             
             for (int a = 0; a < numArcs; a++) {
@@ -1275,27 +2118,130 @@ void drawWindRose() {
     lv_canvas_finish_layer(wind_rose_canvas, &layer);
 }
 
-void sliderAvg_event_handler(lv_event_t * e) {
-  lv_obj_t * slider = (lv_obj_t *)lv_event_get_target(e);
-  sliderAvg = (float)lv_slider_get_value(slider);
-  sendSliderValues();
+// ============================================
+// WiFi Functions (called from ui_events.c)
+// ============================================
+
+extern "C" void populateWifiList() {
+	if (ui_DropdownSSID == NULL) return;
+	
+	Serial.println("Scanning for WiFi networks...");
+	int n = WiFi.scanNetworks();
+	
+	if (n == 0) {
+		lv_dropdown_set_options(ui_DropdownSSID, "No networks found");
+		Serial.println("No WiFi networks found");
+		return;
+	}
+	
+	// Build dropdown string with all SSIDs
+	String options = "";
+	for (int i = 0; i < n; i++) {
+		if (i > 0) options += "\n";
+		options += WiFi.SSID(i);
+		
+		// Log SSID and signal strength
+		Serial.printf("%d: %s (%d dBm)\n", i, WiFi.SSID(i).c_str(), WiFi.RSSI(i));
+	}
+	
+	lv_dropdown_set_options(ui_DropdownSSID, options.c_str());
+	Serial.printf("Found %d networks\n", n);
 }
 
-void sliderGust_event_handler(lv_event_t * e) {
-  lv_obj_t * slider = (lv_obj_t *)lv_event_get_target(e);
-  sliderGust = (float)lv_slider_get_value(slider);
-  sendSliderValues();
+// Modify the SaveWifiFromUI function
+extern "C" void SaveWifiFromUI(lv_event_t * e)
+{
+    Serial.println("=== SaveWifiFromUI called ===");
+    
+    if (ui_DropdownSSID == NULL || ui_TextAreaPassword == NULL) {
+        consoleLog("ERROR: WiFi UI elements not found");
+        Serial.println("ERROR: ui_DropdownSSID or ui_TextAreaPassword is NULL");
+        return;
+    }
+    
+    // Clear console
+    lv_label_set_text(ui_LabelConsole, "");
+    
+    // Get selected SSID from dropdown
+    char ssidBuffer[33];
+    memset(ssidBuffer, 0, sizeof(ssidBuffer));
+    lv_dropdown_get_selected_str(ui_DropdownSSID, ssidBuffer, sizeof(ssidBuffer));
+    
+    Serial.printf("Selected SSID from dropdown: '%s'\n", ssidBuffer);
+    
+    // Get password from text area
+    const char* password = lv_textarea_get_text(ui_TextAreaPassword);
+    
+    Serial.printf("Password from text area: '%s'\n", password);
+    Serial.printf("Password length: %d\n", strlen(password));
+    
+    consoleLog("Saving WiFi credentials...");
+    
+    char logBuf[128];
+    snprintf(logBuf, sizeof(logBuf), "SSID: %s", ssidBuffer);
+    consoleLog(logBuf);
+    
+    snprintf(logBuf, sizeof(logBuf), "Password length: %d chars", strlen(password));
+    consoleLog(logBuf);
+    
+    // Save to Preferences (persistent storage)
+    Preferences preferences;
+    preferences.begin("wifi", false);
+    preferences.putString("ssid", ssidBuffer);
+    preferences.putString("password", password);
+    preferences.end();
+    
+    Serial.println("Credentials saved to Preferences");
+    consoleLog("Credentials saved to flash");
+    
+    // Disconnect if already connected
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("Disconnecting from current WiFi");
+        WiFi.disconnect();
+        delay(100);
+    }
+    
+    // Set flags to attempt connection (manual mode, don't auto-switch screens)
+    wifiConnecting = true;
+    wifiConnectStartTime = millis();
+    autoConnectMode = false;  // Manual connection via UI
+    
+    // Attempt to connect
+    Serial.printf("Calling WiFi.begin('%s', '%s')\n", ssidBuffer, password);
+    WiFi.begin(ssidBuffer, password);
+    consoleLog("Connecting to WiFi...");
+    
+    Serial.println("=== SaveWifiFromUI complete ===");
 }
 
-// -----------------------------------------------------------------------------
-//  SETUP
-// -----------------------------------------------------------------------------
+
+
+void updateBacklight();
+void updateBacklight() {
+    if (millis() - lastManualBrightnessSet < BRIGHTNESS_DEBOUNCE_MS) return;
+
+    // blGamma is maintained by loadSettings(), saveSettings(), and applySettingsToUI().
+    // Do NOT read it from the spinbox here — the spinbox default (10) overwrites
+    // the loaded value before applySettingsToUI() has a chance to correct it.
+
+    int brightness;
+    if (autoBrightness) {
+        if (!lightMeter.measurementReady()) return;
+        float lux = lightMeter.readLightLevel();
+        if (lux < 0) return;
+        brightness = luxToBrightness(lux, brightnessOffset);
+    } else {
+        brightness = brightnessOffset * 16;
+    }
+    ledcWrite(GFX_BL, clampInt(brightness, 0, BL_MAX));
+}
+
+
+
 void setup() {
   Serial.begin(115200);
-  //while (!Serial) ;
   Serial.println("Starting...");
   
-  // Initialize wind vane calibration
   _calibrationParams.vaneADCValues[WMK_ANGLE_0_0] = SFE_WMK_ADC_ANGLE_0_0;
   _calibrationParams.vaneADCValues[WMK_ANGLE_22_5] = SFE_WMK_ADC_ANGLE_22_5;
   _calibrationParams.vaneADCValues[WMK_ANGLE_45_0] = SFE_WMK_ADC_ANGLE_45_0;
@@ -1312,31 +2258,54 @@ void setup() {
   _calibrationParams.vaneADCValues[WMK_ANGLE_292_5] = SFE_WMK_ADC_ANGLE_292_5;
   _calibrationParams.vaneADCValues[WMK_ANGLE_315_0] = SFE_WMK_ADC_ANGLE_315_0;
   _calibrationParams.vaneADCValues[WMK_ANGLE_337_5] = SFE_WMK_ADC_ANGLE_337_5;
-    if (psramFound()) {
-    Serial.println("PSRAM found, allocating sensor histories...");
-    
-    for (int i = 0; i < NUM_TEMP_SENSORS; i++) {
-      sensorHistory[i] = (SensorData*)ps_malloc(TEMP_HISTORY_SIZE * sizeof(SensorData));
-      
+  
+  // Allocate sensor history arrays
+  for (int i = 0; i < NUM_SENSORS; i++) {
+      if (psramFound()) {
+          sensorHistory[i] = (SensorReading*)ps_malloc(SENSOR_HISTORY_SIZE * sizeof(SensorReading));
+      }
       if (sensorHistory[i] == nullptr) {
-        Serial.printf("Failed to allocate PSRAM for sensor %d\n", i + 1);
-      } else {
-        Serial.printf("Sensor %d history allocated in PSRAM\n", i + 1);
-        for (int j = 0; j < TEMP_HISTORY_SIZE; j++) {
-          sensorHistory[i][j].temp = 0.0;
-          sensorHistory[i][j].hum = 0.0;
-          sensorHistory[i][j].pres = 0.0;
-          sensorHistory[i][j].timestamp = 0;
-        }
+          sensorHistory[i] = (SensorReading*)malloc(SENSOR_HISTORY_SIZE * sizeof(SensorReading));
+      }
+      if (sensorHistory[i] != nullptr) {
+          for (int j = 0; j < SENSOR_HISTORY_SIZE; j++) {
+              sensorHistory[i][j].temp = 0;
+              sensorHistory[i][j].hum = 0;
+              sensorHistory[i][j].pres = 0;
+              sensorHistory[i][j].timestamp = 0;
+          }
+      }
+  }
+  
+  if (psramFound()) {
+    tempHistory = (TempDataPoint*)ps_malloc(TEMP_HISTORY_SIZE * sizeof(TempDataPoint));
+    if (tempHistory == nullptr) {
+      Serial.println("Failed to allocate PSRAM for temperature history - using SRAM fallback");
+      tempHistory = tempHistoryFallback;
+      tempHistoryCapacity = TEMP_FALLBACK_SIZE;
+      for (int i = 0; i < tempHistoryCapacity; i++) {
+        tempHistory[i].temp = 0.0;
+        tempHistory[i].timestamp = 0;
+      }
+    } else {
+      Serial.println("Temperature history allocated in PSRAM");
+      tempHistoryCapacity = TEMP_HISTORY_SIZE;
+      for (int i = 0; i < tempHistoryCapacity; i++) {
+        tempHistory[i].temp = 0.0;
+        tempHistory[i].timestamp = 0;
       }
     }
     
-    // Allocate wind history (existing code)
     windHistory = (WindDataPoint*)ps_malloc(WIND_HISTORY_SIZE * sizeof(WindDataPoint));
     if (windHistory == nullptr) {
-      Serial.println("Failed to allocate PSRAM for wind history");
+      Serial.println("Failed to allocate PSRAM for wind history - using SRAM fallback");
       windHistory = windHistoryFallback;
       windHistoryCapacity = WIND_HISTORY_FALLBACK_SIZE;
+      for (int i = 0; i < windHistoryCapacity; i++) {
+        windHistory[i].speed = 0.0;
+        windHistory[i].direction = 0.0;
+        windHistory[i].timestamp = 0;
+      }
     } else {
       Serial.println("Wind history allocated in PSRAM");
       windHistoryCapacity = WIND_HISTORY_SIZE;
@@ -1347,7 +2316,6 @@ void setup() {
       }
     }
     
-    // Allocate wind rose data
     for (int i = 0; i < WIND_DIRECTIONS; i++) {
       windRoseData[i] = (int*)ps_malloc(WIND_SPEED_BINS * sizeof(int));
       if (windRoseData[i] != nullptr) {
@@ -1359,16 +2327,13 @@ void setup() {
         for (int j = 0; j < WIND_SPEED_BINS; j++) windRoseData[i][j] = 0;
       }
     }
-  } else  {
-    Serial.println("PSRAM not found! Using SRAM fallbacks (limited capacity)");
-    tempHistory1 = tempHistory1Fallback;
-    tempHistory2 = tempHistory2Fallback;
+  } else {
+    Serial.println("PSRAM not found! Using SRAM fallbacks.");
+    tempHistory = tempHistoryFallback;
     tempHistoryCapacity = TEMP_FALLBACK_SIZE;
     for (int i = 0; i < tempHistoryCapacity; i++) {
-      tempHistory1[i].temp = 0.0;
-      tempHistory1[i].timestamp = 0;
-      tempHistory2[i].temp = 0.0;
-      tempHistory2[i].timestamp = 0;
+      tempHistory[i].temp = 0.0;
+      tempHistory[i].timestamp = 0;
     }
     windHistory = windHistoryFallback;
     windHistoryCapacity = WIND_HISTORY_FALLBACK_SIZE;
@@ -1384,20 +2349,30 @@ void setup() {
   }
   
     if (!gfx->begin()) {
-        Serial.println("❌ gfx->begin() failed!");
+        Serial.println("× gfx->begin() failed!");
         while (true);
     }
-    gfx->invertDisplay(false);   // first make sure inversion isn't on
+    gfx->invertDisplay(false);
     
     pinMode(GFX_BL, OUTPUT);
-    digitalWrite(GFX_BL, HIGH);   // turn on backlight
+
+    // Set up PWM for backlight (ESP Arduino Core v3.x API)
+    ledcAttach(GFX_BL, BL_PWM_FREQ, BL_PWM_RESOLUTION);
+    ledcWrite(GFX_BL, BL_MAX);  // Full brightness on startup
+
+    // Initialize secondary I2C bus for BH1750
+    I2C_BH1750.begin(17, 18);   // SDA=17, SCL=18
+    if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &I2C_BH1750)) {
+        Serial.println("BH1750 initialized on secondary I2C bus (SDA=17, SCL=18)");
+    } else {
+        Serial.println("BH1750 init failed - check wiring on pins 17/18");
+    }
+
     gfx->fillScreen(RGB565_BLACK);
 
-    // ---- Initialize Touch ----
     touchController.begin();
     touchController.setRotation(ROTATION_INVERTED);
 
-    // ---- Initialize LVGL ----
     lv_init();
     lv_tick_set_cb(millis_cb);
 
@@ -1407,14 +2382,14 @@ void setup() {
 
     screenWidth = gfx->width();
     screenHeight = gfx->height();
-    bufSize = screenWidth * 40; // Partial buffer for speed/memory balance
+    bufSize = screenWidth * 40;
 
     disp_draw_buf = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!disp_draw_buf)
         disp_draw_buf = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_8BIT);
 
     if (!disp_draw_buf) {
-        Serial.println("❌ LVGL disp_draw_buf allocation failed!");
+        Serial.println("× LVGL disp_draw_buf allocation failed!");
         while (true);
     }
 
@@ -1425,196 +2400,207 @@ void setup() {
     lv_indev_t *indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touchpad_read);
-    // ---- Initialize squareline UI ----
-    ui_init(); // Create all squareline screens
-  lv_slider_set_value(ui_SliderAvg, (int32_t)g_sliderAvgValue, LV_ANIM_OFF);
-  lv_slider_set_value(ui_SliderGust, (int32_t)g_sliderGustValue, LV_ANIM_OFF);
-  
-  // Update labels to show initial values
-  char buf[8];
-  snprintf(buf, sizeof(buf), "%.0fs", g_sliderAvgValue);
-  lv_label_set_text(ui_LabelAvgSlider, buf);
-  snprintf(buf, sizeof(buf), "%.0fs", g_sliderGustValue);
-  lv_label_set_text(ui_LabelGustSlider, buf);
-  WiFi.mode(WIFI_STA);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);
-  WiFiManager wm;
-  bool res;
-  res = wm.autoConnect("MrWeather");
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);
-  initSNTP();
+    
+    ui_init();
+    
+    lv_scr_load(ui_ScreenWifi);
+    
+    // Give LVGL time to render
+    lv_timer_handler();
+    delay(100);
+    
+    Serial.println("UI initialized, starting WiFi setup...");
+    
+    // Don't do ANY WiFi/network setup here - let the state machine handle it
+    // Just initialize the state machine
+    wifiStartupState = WIFI_STARTUP_INIT;
+    wifiStartupStepTime = millis();
+    loadSettings();
 
+    // Apply initial brightness (before first BH1750 read)
+    if (!autoBrightness) {
+        ledcWrite(GFX_BL, clampInt(brightnessOffset * 16, 0, BL_MAX));
+    }
 
-  uint8_t currentChannel;
-  wifi_second_chan_t second;
-  esp_wifi_get_channel(&currentChannel, &second);
-  Serial.printf("WiFi Channel: %d\n", currentChannel);
-  
-  uint8_t mac[6];
-  esp_read_mac(mac, ESP_MAC_WIFI_STA);
-  Serial.printf("This device MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  Serial.println("========================================");
-  
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
-    return;
-  }
-  
-  Serial.println("ESP-NOW initialized successfully");
-  esp_now_set_pmk(espnow_pmk);
-  Serial.println("PMK set");
-  esp_now_register_recv_cb(onESPNowReceive);
-  Serial.println("Receive callback registered");
-  espNowQueue = xQueueCreate(32, sizeof(EspNowMsg));
-  if (espNowQueue == NULL) {
-    Serial.println("Failed to create espNowQueue!");
-  } else {
-    Serial.println("espNowQueue created");
-  }
-  Serial.println("ESP-NOW initialized and listening...");
-  esp_now_set_pmk(espnow_pmk);
-
-  // Start UDP server
-  udp.begin(UDP_PORT);
-  Serial.printf("UDP server started on port %d\n", UDP_PORT);
-  
-  // Send WiFi credentials to transmitters after WiFi connects
-  delay(2000);  // Wait for WiFi to stabilize
-  //sendWiFiCredentials();
-  Blynk.config(auth, IPAddress(216, 110, 224, 105), 8080);
-  Blynk.connect();
+    // Conditionally init Blynk
+    if (blynkEnabled) {
+        Blynk.config(auth, IPAddress(216, 110, 224, 105), 8080);
+    }
 }
 
-bool connected = false;
-unsigned long reconnectTime = 0;
 
-
-
-
-// MODIFIED loop() - handle credential requests outside callback
 void loop() {
+    // CRITICAL: Handle LVGL first
     lv_timer_handler();
-    
+    // Detect screen changes and cleanup
+ 
+    // Handle WiFi startup state machine
+    if (wifiStartupState != WIFI_STARTUP_COMPLETE) {
+        handleWifiStartup();
+    }
+
+    // Handle ongoing WiFi connection monitoring
+    checkWifiConnection();
   if ((WiFi.status() == WL_CONNECTED) && (!connected)) {
     connected = true;
     ArduinoOTA.setHostname("SeanTemp");
     ArduinoOTA.begin();
-    Serial.println("Connecting blynk...");
   }
-
-  if ((WiFi.status() == WL_CONNECTED) && (connected)) {
+  if ((WiFi.status() == WL_CONNECTED) && connected) {
     ArduinoOTA.handle();
-    Blynk.run();
-    handleUDPData();
+    if (blynkEnabled) Blynk.run();
+    handleUDP();
   }
-  
-  // NEW: Handle credential requests outside callback
-  if (credentialRequestReceived) {
-    credentialRequestReceived = false;
-    sendWiFiCredentialsToDevice(requestingDeviceMAC);
-  }
-  
-  // Process queued ESP-NOW messages with deduplication
-  EspNowMsg msg;
-  while (espNowQueue != NULL && xQueueReceive(espNowQueue, &msg, 0) == pdTRUE) {
-    const uint8_t sensor1mac[6] = {0x8C, 0xD0, 0xB2, 0xA9, 0x45, 0x45};
-    const uint8_t sensor2mac[6] = {0xD0, 0xCF, 0x13, 0x0B, 0xA0, 0x70};
-    
-    unsigned long currentTime = millis();
-    
-    if (memcmp(msg.mac, sensor1mac, 6) == 0) {
-      if (currentTime - s1LastMsgTime < MSG_MIN_INTERVAL) {
-        Serial.printf("Sensor1: Duplicate rejected (only %lums since last)\n", currentTime - s1LastMsgTime);
-        sensor1MsgCount++;
-        continue;
-      }
-      
-      if (msg.len == sizeof(esp_now_payload_t)) {
-        esp_now_payload_t payload;
-        memcpy(&payload, msg.payload, sizeof(payload));
-        s1LastUpdate = millis();
-        s1LastMsgTime = currentTime;
-        s1temp = payload.temp;
-        s1hum = payload.hum;
-        s1pres = payload.presread;
-        s1vBat = payload.volts0;
-       // addTempToHistory(s1temp, 1);
-        sensor1MsgCount++;
-        Serial.printf("Sensor1: Message processed (temp=%.1f)\n", s1temp);
-      }
-    } else if (memcmp(msg.mac, sensor2mac, 6) == 0) {
-      if (currentTime - s2LastMsgTime < MSG_MIN_INTERVAL) {
-        Serial.printf("Sensor2: Duplicate rejected (only %lums since last)\n", currentTime - s2LastMsgTime);
-        sensor2MsgCount++;
-        continue;
-      }
-      
-      if (msg.len == sizeof(esp_now_payload_wind_t)) {
-        esp_now_payload_wind_t payload;
-        memcpy(&payload, msg.payload, sizeof(payload));
-        s2LastUpdate = millis();
-        s2LastMsgTime = currentTime;
-        s2temp = payload.temp;
-        //addTempToHistory(s2temp, 2);
-        s2windgust = payload.windgust;
-        s2avgwind = payload.avgwind;
-        s2instwind = payload.instwind;
-        s2winddirV = payload.winddirV;
-        float windDir = getWindDirection();
-        Serial.printf("Wind: speed=%.1f, direction=%.1f°\n", s2avgwind, windDir);
-        addWindData(s2avgwind, getWindDirection());
-        sensor2MsgCount++;
-        Serial.printf("Sensor2: Message processed (wind=%.1f)\n", windDir);
-      }
+    // === SEPARATE CHART UPDATE - OUTSIDE every(500) ===
+    static unsigned long lastChartCheck = 0;
+    if (millis() - lastChartCheck > 1000) {  // Only check every 1 second
+        lastChartCheck = millis();
+        
+        // Screen change detection
+        static lv_obj_t * prev_screen = NULL;
+        static unsigned long screen_change_time = 0;
+        lv_obj_t * curr_screen = lv_screen_active();
+        
+        if (prev_screen != curr_screen) {
+            Serial.printf("Screen changed: %p -> %p\n", prev_screen, curr_screen);
+            screen_change_time = millis();
+            
+            if (prev_screen == ui_ScreenChart && curr_screen != ui_ScreenChart) {
+                Serial.println("Leaving chart screen - cleanup");
+                cleanupChartContainers();
+            }
+            
+            if (curr_screen == ui_ScreenChart && prev_screen != ui_ScreenChart) {
+                Serial.println("Entering chart screen - will initialize");
+            }
+            
+            prev_screen = curr_screen;
+        }
+        
+        // Only draw if on chart screen and stable
+        if (curr_screen == ui_ScreenChart && (millis() - screen_change_time > 500)) {
+            Serial.println("About to call drawGenericChart()");
+            unsigned long start = millis();
+            drawGenericChart();
+            unsigned long duration = millis() - start;
+            Serial.printf("drawGenericChart() took %lu ms\n", duration);
+        }
     }
-  }
+    
   
-  unsigned long secondsSinceUpdate1 = (millis() - s1LastUpdate) / 1000;
-  unsigned long secondsSinceUpdate2 = (millis() - s2LastUpdate) / 1000;
-  
-  // Update UI labels every 500ms
   every(500) {
     char buf[64];
-    
-    // Display wind sensor data (sensor 0)
-    if (s0temp < 200) {
-      snprintf(buf, sizeof(buf), "%.2f°C", s0temp);
-      lv_label_set_text(ui_LabelTemp, buf);
+    if (lv_screen_active() == ui_ScreenSettings) {
+        updateSettingsWifiInfo();
     }
-    
-    if (s0avgwind != 999) {
-      snprintf(buf, sizeof(buf), "%.1fkph", s0avgwind);
-      lv_label_set_text(ui_Label4, buf);
-    }
-
-    if (s0winddirV != 999) {
-      float windDir = getWindDirection();
-      const char* cardinal = getCardinalDirection(windDir);
-      lv_label_set_text(ui_Label5, cardinal);
-    }
-    
-    // Display sensor last update times
-    for (int i = 0; i < NUM_TEMP_SENSORS; i++) {
-      unsigned long secondsSinceUpdate = (millis() - sensorLastUpdate[i]) / 1000;
-      // Update your UI labels for each sensor's last update time
-      // Example: snprintf(buf, sizeof(buf), "%lus", secondsSinceUpdate);
-    }
-    
-    // Display wind sensor last update
-    unsigned long secondsSinceUpdate0 = (millis() - s0LastUpdate) / 1000;
-    snprintf(buf, sizeof(buf), "%lus", secondsSinceUpdate0);
-    lv_label_set_text(ui_LabelLU2, buf);
-    
-    if (WiFi.status() == WL_CONNECTED) {
-      snprintf(buf, sizeof(buf), "%s", WiFi.localIP().toString().c_str());
-      lv_label_set_text(ui_LabelIP, buf);
+    // Update sensor 0 displays (LabelTemp0, LabelHum0, LabelPres0)
+    SensorReading* s0 = getLatestReading(0);
+    if (s0 != nullptr) {
+      snprintf(buf, sizeof(buf), "%.1f°C", s0->temp);
+      lv_label_set_text(ui_LabelTemp0, buf);
       
-      snprintf(buf, sizeof(buf), "RSSI: %ddB", WiFi.RSSI());
-      lv_label_set_text(ui_Label3, buf);
+      snprintf(buf, sizeof(buf), "%.0f%%", s0->hum);
+      lv_label_set_text(ui_LabelHum0, buf);
+      
+      snprintf(buf, sizeof(buf), "%.1fmbar", s0->pres);
+      lv_label_set_text(ui_LabelPres0, buf);
+      
+      // Calculate time since last update
+      time_t now = time(nullptr);
+      if (s0->timestamp > 1577836800 && s0->timestamp <= now) {
+        unsigned long secondsSince = now - s0->timestamp;
+        snprintf(buf, sizeof(buf), "%lus", secondsSince);
+      } else {
+        snprintf(buf, sizeof(buf), "--");
+      }
+      lv_label_set_text(ui_LabelLU0, buf);
+    }
+    if (lv_screen_active() == ui_ScreenChart) {
+        chart_needs_update = true;
+    }
+    // Update sensor 1 displays (LabelTemp1, LabelHum1, LabelPres1)
+    SensorReading* s1 = getLatestReading(1);
+    if (s1 != nullptr) {
+      snprintf(buf, sizeof(buf), "%.1f°C", s1->temp);
+      lv_label_set_text(ui_LabelTemp1, buf);
+      
+      snprintf(buf, sizeof(buf), "%.0f%%", s1->hum);
+      lv_label_set_text(ui_LabelHum1, buf);
+      
+      snprintf(buf, sizeof(buf), "%.1fmbar", s1->pres);
+      lv_label_set_text(ui_LabelPres1, buf);
+      
+      time_t now = time(nullptr);
+      if (s1->timestamp > 1577836800 && s1->timestamp <= now) {
+        unsigned long secondsSince = now - s1->timestamp;
+        snprintf(buf, sizeof(buf), "%lus", secondsSince);
+      } else {
+        snprintf(buf, sizeof(buf), "--");
+      }
+      lv_label_set_text(ui_LabelLU1, buf);
     }
     
-    // Display time
+    // Update sensor 2 displays (LabelTemp2, LabelHum2, LabelPres2)
+    SensorReading* s2 = getLatestReading(2);
+    if (s2 != nullptr) {
+      snprintf(buf, sizeof(buf), "%.1f°C", s2->temp);
+      lv_label_set_text(ui_LabelTemp2, buf);
+      
+      snprintf(buf, sizeof(buf), "%.0f%%", s2->hum);
+      lv_label_set_text(ui_LabelHum2, buf);
+      
+      snprintf(buf, sizeof(buf), "%.1fmbar", s2->pres);
+      lv_label_set_text(ui_LabelPres2, buf);
+      
+      time_t now = time(nullptr);
+      if (s2->timestamp > 1577836800 && s2->timestamp <= now) {
+        unsigned long secondsSince = now - s2->timestamp;
+        snprintf(buf, sizeof(buf), "%lus", secondsSince);
+      } else {
+        snprintf(buf, sizeof(buf), "--");
+      }
+      lv_label_set_text(ui_LabelLU2, buf);
+    }
+    
+    // Update sensor 3 displays (LabelTemp3, LabelHum3, LabelPres3)
+    SensorReading* s3 = getLatestReading(3);
+    if (s3 != nullptr) {
+      snprintf(buf, sizeof(buf), "%.1f°C", s3->temp);
+      lv_label_set_text(ui_LabelTemp3, buf);
+      
+      snprintf(buf, sizeof(buf), "%.0f%%", s3->hum);
+      lv_label_set_text(ui_LabelHum3, buf);
+      
+      snprintf(buf, sizeof(buf), "%.1fmbar", s3->pres);
+      lv_label_set_text(ui_LabelPres3, buf);
+      
+      time_t now = time(nullptr);
+      if (s3->timestamp > 1577836800 && s3->timestamp <= now) {
+        unsigned long secondsSince = now - s3->timestamp;
+        snprintf(buf, sizeof(buf), "%lus", secondsSince);
+      } else {
+        snprintf(buf, sizeof(buf), "--");
+      }
+      lv_label_set_text(ui_LabelLU3, buf);
+    }
+    
+    // Update wind data (if available from windHistory)
+    if (windHistory != nullptr && windHistoryCount > 0) {
+      int lastIdx = (windHistoryIndex - 1 + windHistoryCapacity) % windHistoryCapacity;
+      float speed = windHistory[lastIdx].speed;
+      float gust = windHistory[lastIdx].gust;
+      float direction = windHistory[lastIdx].direction;
+      
+      snprintf(buf, sizeof(buf), "%.1fkph", speed);
+      lv_label_set_text(ui_LabelWind, buf);
+      snprintf(buf, sizeof(buf), "%.1fkph", gust);
+      lv_label_set_text(ui_LabelWind1, buf);
+      
+      const char* cardinal = getCardinalDirection(direction);
+      lv_label_set_text(ui_LabelWindDir, cardinal);
+    }
+    
+    // Update time display (LabelTime)
     time_t now = time(nullptr);
     struct tm* timeinfo = localtime(&now);
     int hour = timeinfo->tm_hour;
@@ -1625,39 +2611,74 @@ void loop() {
     else if (hour == 0) hour = 12;
     snprintf(buf, sizeof(buf), "%d:%02d:%02d %s", hour, min, sec, ampm);
     lv_label_set_text(ui_LabelTime, buf);
+
+    
+    
+    // Always update wind rose on main screen
+    if (lv_screen_active() == ui_ScreenMain) {
+        drawWindRose();
+    }
+    updateBacklight();
   }
-  
-  every(2000) {
-    drawTempGraph();
-    drawWindRose();
+
+  every (2000) {
+    if (lv_screen_active() != ui_ScreenChart) {
+        chart_needs_init = false;
+        chart_needs_update = false;
+        return;
+    }
+    
+
   }
   
   every(30000) {
-    if (s0instwind != 999) {
-      Blynk.virtualWrite(V11, s0instwind);
-      Blynk.virtualWrite(V12, s0avgwind);
-      Blynk.virtualWrite(V13, s0windgust);
-      Blynk.virtualWrite(V15, getWindDirection());
+    // Send latest wind data to Blynk every 30 seconds
+    if (!blynkEnabled) return; 
+    if (windHistory != nullptr && windHistoryCount > 0) {
+      int lastIdx = (windHistoryIndex - 1 + windHistoryCapacity) % windHistoryCapacity;
+      Blynk.virtualWrite(V12, windHistory[lastIdx].speed);
+      Blynk.virtualWrite(V13, s2windgust);
+      Blynk.virtualWrite(V15, windHistory[lastIdx].direction);
     }
     Blynk.virtualWrite(V14, WiFi.RSSI());
-    if (sensorTemps[0] != 999) {
-      Blynk.virtualWrite(V16, sensorTemps[0]);
-    }
-    if (s0temp < 200) {
-      
-      Blynk.virtualWrite(V17, s0temp);
-    }
 
-    //Serial.printf("ESPNow: C1=%lu C2=%lu QDropped=%lu\n", sensor1MsgCount, sensor2MsgCount, espNowQueueDroppedCount);
+    // Send latest sensor data to Blynk
+
+      if (sensorHistory[0] != nullptr && sensorHistoryCount[0] > 0) {
+        int idx = (sensorHistoryIndex[0] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
+        Blynk.virtualWrite(V16, sensorHistory[0][idx].temp);
+      }
+      if (sensorHistory[1] != nullptr && sensorHistoryCount[1] > 0) {
+        int idx = (sensorHistoryIndex[1] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
+        Blynk.virtualWrite(V17, sensorHistory[1][idx].temp);
+      }
+      if (sensorHistory[2] != nullptr && sensorHistoryCount[2] > 0) {
+        int idx = (sensorHistoryIndex[2] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
+        Blynk.virtualWrite(V18, sensorHistory[2][idx].temp);
+      }
+      if (sensorHistory[3] != nullptr && sensorHistoryCount[3] > 0) {
+        int idx = (sensorHistoryIndex[3] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
+        Blynk.virtualWrite(V19, sensorHistory[3][idx].temp);
+      }
+
+      if (sensorHistory[0] != nullptr && sensorHistoryCount[0] > 0) {
+        int idx = (sensorHistoryIndex[0] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
+        Blynk.virtualWrite(V21, sensorHistory[0][idx].hum);
+      }
+      if (sensorHistory[1] != nullptr && sensorHistoryCount[1] > 0) {
+        int idx = (sensorHistoryIndex[1] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
+        Blynk.virtualWrite(V22, sensorHistory[1][idx].hum);
+      }
+      if (sensorHistory[2] != nullptr && sensorHistoryCount[2] > 0) {
+        int idx = (sensorHistoryIndex[2] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
+        Blynk.virtualWrite(V23, sensorHistory[2][idx].hum);
+      }
+      if (sensorHistory[3] != nullptr && sensorHistoryCount[3] > 0) {
+        int idx = (sensorHistoryIndex[3] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
+        Blynk.virtualWrite(V24, sensorHistory[3][idx].hum);
+      }
   }
-  
-  if (g_sliderValuesChanged && WiFi.status() == WL_CONNECTED) {
-    sendSliderValues();
-  }
-  
-  every(60000) {
-    if (WiFi.status() == WL_CONNECTED) {
-      sendSliderValues();
-    }
-  }
+ // every(60000){
+ //   sendSliderValuesToWindTransmitter();
+ // }
 }
