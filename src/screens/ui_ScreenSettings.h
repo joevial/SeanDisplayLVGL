@@ -27,6 +27,7 @@ extern lv_obj_t * ui_Label8;
 extern lv_obj_t * ui_Label12;
 extern lv_obj_t * ui_Spinbox1;
 extern lv_obj_t * ui_Spinbox2;
+extern lv_obj_t * ui_Spinbox4;
 extern void ui_event_Button5(lv_event_t * e);
 extern lv_obj_t * ui_Button5;
 extern void ui_event_Button1(lv_event_t * e);
@@ -58,7 +59,6 @@ extern lv_obj_t * ui_Label31;
 extern lv_obj_t * ui_Label32;
 extern lv_obj_t * ui_Label33;
 extern lv_obj_t * ui_Label34;
-extern lv_obj_t * ui_Spinbox4;
 extern lv_obj_t * ui_Label35;
 extern lv_obj_t * ui_Switch2;
 extern lv_obj_t * ui_Label36;
@@ -71,6 +71,12 @@ extern lv_obj_t * ui_Label38;
 extern lv_obj_t * ui_Label39;
 extern lv_obj_t * ui_Spinbox5;
 extern lv_obj_t * ui_Label40;
+extern lv_obj_t * ui_Label41;
+extern lv_obj_t * ui_Switch3;
+extern lv_obj_t * ui_Label42;
+extern lv_obj_t * ui_Label43;
+extern lv_obj_t * ui_Dropdown1;
+extern lv_obj_t * ui_Label44;
 // CUSTOM VARIABLES
 
 #ifdef __cplusplus

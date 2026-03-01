@@ -24,7 +24,7 @@ float currentAvgWindow = 60.0;   // Default 60 seconds
 float currentGustWindow = 1.0;   // Default 1 second
 static bool chart_needs_init = false;
 static bool chart_needs_update = false;
-// Secondary I2C bus for BH1750 (pins 17=SDA, 18=SCL)
+static unsigned long lastCountdown = 0;  // global so SaveWifiFromUI can reset it
 TwoWire I2C_BH1750 = TwoWire(1);   // Use I2C bus #1
 BH1750 lightMeter;
 float windOffsetPercent = 1.0f;   // multiplier applied to wind values (1.0 = no change)
@@ -33,10 +33,51 @@ bool  autoBrightness    = true;   // Switch1
 bool  blynkEnabled      = true;   // Switch2
 bool  blynkWasEnabled   = true;   // track previous state to detect "just turned on"
 
+// Wind rose settings
+bool  windRoseUseGust   = false;  // Switch3: false=speed, true=gust
+int   windRoseSpeedBinSelection = 0;  // Dropdown1: 0="5,10,20,30", 1="10,20,30,40", etc.
+int   windRoseSpeedBins[5] = {5, 10, 20, 30, 0};  // Current speed bins (4 thresholds + padding)
+
 // Helper: clamp int to [lo, hi]
 static inline int clampInt(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
+
+// Helper function to set wind rose speed bins based on dropdown selection
+void updateWindRoseSpeedBins() {
+    switch (windRoseSpeedBinSelection) {
+        case 0: // "5,10,20,30"
+            windRoseSpeedBins[0] = 5;
+            windRoseSpeedBins[1] = 10;
+            windRoseSpeedBins[2] = 20;
+            windRoseSpeedBins[3] = 30;
+            break;
+        case 1: // "10,20,30,40"
+            windRoseSpeedBins[0] = 10;
+            windRoseSpeedBins[1] = 20;
+            windRoseSpeedBins[2] = 30;
+            windRoseSpeedBins[3] = 40;
+            break;
+        case 2: // "5,10,15,20"
+            windRoseSpeedBins[0] = 5;
+            windRoseSpeedBins[1] = 10;
+            windRoseSpeedBins[2] = 15;
+            windRoseSpeedBins[3] = 20;
+            break;
+        case 3: // "8,16,24,32"
+            windRoseSpeedBins[0] = 8;
+            windRoseSpeedBins[1] = 16;
+            windRoseSpeedBins[2] = 24;
+            windRoseSpeedBins[3] = 32;
+            break;
+        default:
+            windRoseSpeedBins[0] = 5;
+            windRoseSpeedBins[1] = 10;
+            windRoseSpeedBins[2] = 20;
+            windRoseSpeedBins[3] = 30;
+    }
+}
+
 // Backlight PWM config
 #define BL_PWM_FREQ       5000
 #define BL_PWM_RESOLUTION 12         // 12-bit: 0-4095
@@ -49,6 +90,9 @@ bool connected = false;
 unsigned long reconnectTime = 0;
 static unsigned long lastManualBrightnessSet = 0;
 #define BRIGHTNESS_DEBOUNCE_MS 1200   // skip auto-update for 1.2s after manual set
+#define FADE_DURATION_MS 500          // Fade transition duration in milliseconds
+static bool isFading = false;         // Track if a fade is currently in progress
+static unsigned long fadeStartTime = 0;  // When the current fade started
 
 enum WifiStartupState {
     WIFI_STARTUP_INIT,           // Initial state - set up WiFi mode
@@ -263,6 +307,8 @@ void loadSettings() {
     int savedAvg      = prefs.getInt ("avgWindow",  60);
     int savedGust     = prefs.getInt ("gustWindow", 1);
     int savedGamma    = prefs.getInt ("blGamma",    10);
+    windRoseUseGust   = prefs.getBool("windRoseUseGust", false);
+    windRoseSpeedBinSelection = prefs.getInt("windRoseBinSel", 0);
     prefs.end();
 
     blGamma           = savedGamma / 10.0f;
@@ -270,15 +316,17 @@ void loadSettings() {
     currentAvgWindow  = (float)savedAvg;
     currentGustWindow = (float)savedGust;
     blynkWasEnabled   = blynkEnabled;
+    
+    updateWindRoseSpeedBins();
 
-    Serial.printf("loadSettings: autoBright=%d blynk=%d brightOff=%d windOffRaw=%d avg=%d gust=%d gamma=%d\n",
-                  autoBrightness, blynkEnabled, brightnessOffset, sp4raw, savedAvg, savedGust, savedGamma);
+    //Serial.printf("loadSettings: autoBright=%d blynk=%d brightOff=%d windOffRaw=%d avg=%d gust=%d gamma=%d windRoseUseGust=%d binSel=%d\n",
+               //   autoBrightness, blynkEnabled, brightnessOffset, sp4raw, savedAvg, savedGust, savedGamma, windRoseUseGust, windRoseSpeedBinSelection);
 }
 
 // Console logging helper
 void consoleLog(const char* message) {
-    // Always print to serial first
-    Serial.println(message);
+    // Always print to //Serial first
+    //Serial.println(message);
     
     if (ui_LabelConsole == NULL) {
         return;
@@ -302,7 +350,7 @@ bool loadWifiCredentials(String &ssid, String &password) {
     password = preferences.getString("password", "");
     preferences.end();
     
-    Serial.printf("loadWifiCredentials: SSID='%s', Password='%s'\n", ssid.c_str(), password.c_str());
+    //Serial.printf("loadWifiCredentials: SSID='%s', Password='%s'\n", ssid.c_str(), password.c_str());
     
     return (ssid.length() > 0);
 }
@@ -327,69 +375,78 @@ static int luxToBrightness(float lux, int offset) {
 
 void checkWifiConnection();
 
-// MODIFIED: checkWifiConnection to trigger network scan on timeout
 void checkWifiConnection() {
     if (!wifiConnecting) return;
     
     unsigned long elapsed = millis() - wifiConnectStartTime;
+    unsigned long remaining = (WIFI_CONNECT_TIMEOUT - elapsed) / 1000;
     
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("WiFi connected successfully!");
-        Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
-        Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+        //Serial.println("WiFi connected successfully!");
         
-        consoleLog("WiFi connected successfully!");
+        consoleLog("WiFi connected!");
         
         char logBuf[128];
         snprintf(logBuf, sizeof(logBuf), "IP: %s", WiFi.localIP().toString().c_str());
+        //Serial.println(logBuf);
         consoleLog(logBuf);
         
         snprintf(logBuf, sizeof(logBuf), "RSSI: %d dBm", WiFi.RSSI());
+        //Serial.println(logBuf);
         consoleLog(logBuf);
+        
+        lv_timer_handler();
         
         wifiConnecting = false;
         wifiConfigured = true;
         
-        // SNTP is already initialized in setup() - just log it
-        Serial.println("Time sync active");
-        consoleLog("Time sync active");
+        //Serial.println("Time sync active");
         
-        // Initialize Blynk if not already done
         if (!connected && blynkEnabled) {
             Blynk.config(auth, IPAddress(216, 110, 224, 105), 8080);
             Blynk.connect();
-            Serial.println("Blynk connecting...");
-            consoleLog("Blynk connecting...");
+            //Serial.println("Blynk connecting...");
         }
         
-        // Only auto-switch to main screen if we connected using saved credentials on boot
         if (autoConnectMode) {
-            Serial.println("Auto-connect mode - switching to main screen");
+            //Serial.println("Auto-connect mode - switching to main screen");
             consoleLog("Loading main screen...");
-            delay(1000);  // Brief delay to see the success message
+            lv_timer_handler();
+            delay(1500);
             lv_scr_load(ui_ScreenMain);
-            autoConnectMode = false;  // Reset flag
+            autoConnectMode = false;
+        } else {
+            // Manual connect via WiFi screen - also switch to main
+            consoleLog("Switching to main screen...");
+            lv_timer_handler();
+            delay(1500);
+            // Save credentials before leaving
+            // (already saved in SaveWifiFromUI, but make sure settings are saved too)
+            lv_scr_load(ui_ScreenMain);
         }
     } 
     else if (elapsed > WIFI_CONNECT_TIMEOUT) {
-        Serial.println("WiFi connection timeout!");
-        Serial.printf("WiFi status: %d\n", WiFi.status());
+        //Serial.println("WiFi connection timeout!");
+        //Serial.printf("WiFi status: %d\n", WiFi.status());
         
-        consoleLog("WiFi connection timeout!");
-        consoleLog("Check credentials and try again");
+        consoleLog("Connection timed out!");
+        consoleLog("Check credentials and try again.");
+        lv_timer_handler();
+        
         wifiConnecting = false;
         wifiConfigured = false;
-        autoConnectMode = false;  // Reset flag on failure
-        
-        // If this was during startup, the state machine will trigger a scan
+        autoConnectMode = false;
     }
     else {
-        // Still connecting - show progress every 2 seconds
-        static unsigned long lastDot = 0;
-        if (millis() - lastDot > 2000) {
-            Serial.printf("Still connecting... (status: %d, elapsed: %lu ms)\n", WiFi.status(), elapsed);
-            consoleLog("...");
-            lastDot = millis();
+        // Show countdown every 2 seconds
+        if (millis() - lastCountdown > 2000) {
+            lastCountdown = millis();
+            
+            char logBuf[64];
+            snprintf(logBuf, sizeof(logBuf), "Connecting... %lus remaining", remaining);
+            //Serial.println(logBuf);
+            consoleLog(logBuf);
+            lv_timer_handler();
         }
     }
 }
@@ -416,14 +473,19 @@ extern "C" void applySettingsToUI() {
         if (blynkEnabled) lv_obj_add_state(ui_Switch2, LV_STATE_CHECKED);
         else              lv_obj_remove_state(ui_Switch2, LV_STATE_CHECKED);
     }
+    if (ui_Switch3 != NULL) {
+        if (windRoseUseGust) lv_obj_add_state(ui_Switch3, LV_STATE_CHECKED);
+        else                 lv_obj_remove_state(ui_Switch3, LV_STATE_CHECKED);
+    }
     if (ui_Spinbox1 != NULL) lv_spinbox_set_value(ui_Spinbox1, (int32_t)currentAvgWindow);
     if (ui_Spinbox2 != NULL) lv_spinbox_set_value(ui_Spinbox2, (int32_t)currentGustWindow);
     if (ui_Spinbox3 != NULL) lv_spinbox_set_value(ui_Spinbox3, brightnessOffset);
     if (ui_Spinbox4 != NULL) lv_spinbox_set_value(ui_Spinbox4, (int32_t)((windOffsetPercent - 1.0f) * 1000.0f));
     if (ui_Spinbox5 != NULL) lv_spinbox_set_value(ui_Spinbox5, (int32_t)(blGamma * 10.0f));
-    Serial.println("Settings applied to UI");
-    Serial.printf("autoBrightness=%d blynkEnabled=%d avgWindow=%.1f gustWindow=%.1f brightOffset=%d windOffsetRaw=%d blGamma=%d\n",
-                  autoBrightness, blynkEnabled, currentAvgWindow, currentGustWindow, brightnessOffset, (int32_t)((windOffsetPercent - 1.0f) * 1000.0f), (int32_t)(blGamma * 10.0f));
+    if (ui_Dropdown1 != NULL) lv_dropdown_set_selected(ui_Dropdown1, windRoseSpeedBinSelection);
+    //Serial.println("Settings applied to UI");
+    //Serial.printf("autoBrightness=%d blynkEnabled=%d avgWindow=%.1f gustWindow=%.1f brightOffset=%d windOffsetRaw=%d blGamma=%d windRoseUseGust=%d binSel=%d\n",
+                //  autoBrightness, blynkEnabled, currentAvgWindow, currentGustWindow, brightnessOffset, (int32_t)((windOffsetPercent - 1.0f) * 1000.0f), (int32_t)(blGamma * 10.0f), windRoseUseGust, windRoseSpeedBinSelection);
 }
 
 extern "C" void updateBacklightLive(bool autoMode, int offset) {
@@ -438,14 +500,22 @@ extern "C" void updateBacklightLive(bool autoMode, int offset) {
     } else {
         brightness = offset * 16;
     }
+    brightness = clampInt(brightness, 0, BL_MAX);
     lastManualBrightnessSet = millis();
-    ledcWrite(GFX_BL, clampInt(brightness, 0, BL_MAX));
+    
+    // Only start a new fade if one isn't already in progress
+    if (!isFading) {
+        isFading = true;
+        fadeStartTime = millis();
+        ledcFade(GFX_BL, ledcRead(GFX_BL), brightness, FADE_DURATION_MS);
+    }
 }
 
 extern "C" void saveSettings() {
     if (ui_Switch1  == NULL || ui_Switch2  == NULL ||
         ui_Spinbox3 == NULL || ui_Spinbox4 == NULL ||
-        ui_Spinbox1 == NULL || ui_Spinbox2 == NULL) return;
+        ui_Spinbox1 == NULL || ui_Spinbox2 == NULL ||
+        ui_Switch3  == NULL || ui_Dropdown1 == NULL) return;
 
     bool newAutoBright  = lv_obj_has_state(ui_Switch1, LV_STATE_CHECKED);
     bool newBlynk       = lv_obj_has_state(ui_Switch2, LV_STATE_CHECKED);
@@ -454,6 +524,9 @@ extern "C" void saveSettings() {
     int  newAvgWindow   = (int)lv_spinbox_get_value(ui_Spinbox1);
     int  newGustWindow  = (int)lv_spinbox_get_value(ui_Spinbox2);
     int  newGammaRaw  =   (int)lv_spinbox_get_value(ui_Spinbox5);
+    bool newWindRoseUseGust = lv_obj_has_state(ui_Switch3, LV_STATE_CHECKED);
+    int  newWindRoseBinSel  = (int)lv_dropdown_get_selected(ui_Dropdown1);
+    
     Preferences prefs;
     prefs.begin("appsettings", false);
     prefs.putBool("autoBright", newAutoBright);
@@ -463,6 +536,8 @@ extern "C" void saveSettings() {
     prefs.putInt ("avgWindow",  newAvgWindow);
     prefs.putInt ("gustWindow", newGustWindow);
     prefs.putInt ("blGamma",    newGammaRaw);
+    prefs.putBool("windRoseUseGust", newWindRoseUseGust);
+    prefs.putInt ("windRoseBinSel", newWindRoseBinSel);
     prefs.end();
 
     // Apply immediately
@@ -472,30 +547,34 @@ extern "C" void saveSettings() {
     currentAvgWindow  = newAvgWindow;
     currentGustWindow = newGustWindow;
     blGamma = newGammaRaw / 10.0f;
+    windRoseUseGust = newWindRoseUseGust;
+    windRoseSpeedBinSelection = newWindRoseBinSel;
+    updateWindRoseSpeedBins();
+    
     // Handle Blynk enable/disable transition
     bool wasEnabled = blynkEnabled;
     blynkEnabled    = newBlynk;
 
     if (blynkEnabled && !wasEnabled) {
-        Serial.println("Blynk re-enabled by user — connecting");
+        //Serial.println("Blynk re-enabled by user — connecting");
         consoleLog("Blynk enabled — connecting...");
         Blynk.config(auth, IPAddress(216, 110, 224, 105), 8080);
         if (WiFi.status() == WL_CONNECTED) Blynk.connect();
     } else if (!blynkEnabled && wasEnabled) {
-        Serial.println("Blynk disabled by user");
+        //Serial.println("Blynk disabled by user");
         consoleLog("Blynk disabled");
         Blynk.disconnect();
     }
 
-    Serial.printf("saveSettings: autoBright=%d blynk=%d brightOff=%d windOffRaw=%d avgWin=%d gustWin=%d gamma=%f\n",
-                  autoBrightness, blynkEnabled, brightnessOffset, newWindOffRaw, newAvgWindow, newGustWindow, blGamma);
+    //Serial.printf("saveSettings: autoBright=%d blynk=%d brightOff=%d windOffRaw=%d avgWin=%d gustWin=%d gamma=%f windRoseUseGust=%d binSel=%d\n",
+                 // autoBrightness, blynkEnabled, brightnessOffset, newWindOffRaw, newAvgWindow, newGustWindow, blGamma, newWindRoseUseGust, newWindRoseBinSel);
     consoleLog("Settings saved.");
 }
 
 
 extern "C" void sendSliderValuesToWindTransmitter() {
     if (!wifiConfigured || WiFi.status() != WL_CONNECTED) {
-        Serial.println("Cannot send slider values - WiFi not connected");
+        //Serial.println("Cannot send slider values - WiFi not connected");
         return;
     }
 
@@ -525,7 +604,7 @@ extern "C" void sendSliderValuesToWindTransmitter() {
     udp.write((uint8_t *)&sliders, sizeof(sliders));
     udp.endPacket();
 
-    Serial.printf("Sent slider values via UDP - Avg: %.1f, Gust: %.1f\n", avgVal, gustVal);
+    //Serial.printf("Sent slider values via UDP - Avg: %.1f, Gust: %.1f\n", avgVal, gustVal);
 
     char logBuf[128];
     snprintf(logBuf, sizeof(logBuf), "Sent: Avg=%.1fs, Gust=%.1fs", avgVal, gustVal);
@@ -664,7 +743,7 @@ static void chart_draw_label_cb(lv_event_t * e) {
       
       float speed = windHistory[idx].speed;
       float gust = windHistory[idx].gust;
-      time_t timestamp = (time_t)(windHistory[idx].timestamp / 1000);  // Convert millis to seconds
+      time_t timestamp = (time_t)windHistory[idx].timestamp;  // Already in unix seconds
       
       // Create label popup if it doesn't exist
       if(chart_label_popup == NULL) {
@@ -1081,7 +1160,7 @@ void addWindData(float speed, float direction, float gust) {
     windHistory[windHistoryIndex].speed     = adjSpeed;
     windHistory[windHistoryIndex].gust      = adjGust;
     windHistory[windHistoryIndex].direction = direction;
-    windHistory[windHistoryIndex].timestamp = millis();
+    windHistory[windHistoryIndex].timestamp = (unsigned long)time(nullptr);
 
     windHistoryIndex = (windHistoryIndex + 1) % windHistoryCapacity;
     if (windHistoryCount < windHistoryCapacity) windHistoryCount++;
@@ -1096,10 +1175,26 @@ void addWindData(float speed, float direction, float gust) {
     int startIdx = (windHistoryIndex - windHistoryCount + windHistoryCapacity) % windHistoryCapacity;
     for (int i = 0; i < windHistoryCount; i++) {
         int idx   = (startIdx + i) % windHistoryCapacity;
-        float spd = windHistory[idx].gust;
+        
+        // Choose data source: gust if Switch3 is checked, otherwise speed
+        float spd = (windRoseUseGust) ? windHistory[idx].gust : windHistory[idx].speed;
         float dir = windHistory[idx].direction;
         int dirBin = (int)((dir + 11.25f) / 22.5f) % WIND_DIRECTIONS;
-        int spdBin = (spd < 5) ? 0 : (spd < 10) ? 1 : (spd < 20) ? 2 : (spd < 30) ? 3 : 4;
+        
+        // Calculate speed bin based on configured thresholds
+        int spdBin;
+        if (spd < windRoseSpeedBins[0]) {
+            spdBin = 0;
+        } else if (spd < windRoseSpeedBins[1]) {
+            spdBin = 1;
+        } else if (spd < windRoseSpeedBins[2]) {
+            spdBin = 2;
+        } else if (spd < windRoseSpeedBins[3]) {
+            spdBin = 3;
+        } else {
+            spdBin = 4;
+        }
+        
         if (windRoseData[dirBin] != nullptr)
             windRoseData[dirBin][spdBin]++;
     }
@@ -1107,13 +1202,13 @@ void addWindData(float speed, float direction, float gust) {
 
 
 void cbSyncTime(struct timeval *tv) {
-  Serial.println("NTP time synched");
+  //Serial.println("NTP time synched");
   getLocalTime(&timeinfo);
   time_t rawtime;
   struct tm* timeinfo;
   time(&rawtime);
   timeinfo = localtime(&rawtime);
-  Serial.println(asctime(timeinfo));
+  //Serial.println(asctime(timeinfo));
   time_t now = time(nullptr);
   localTimeUnix = static_cast<uint32_t>(now);
   isSetNtp = true;
@@ -1184,7 +1279,7 @@ void cleanupChartContainers() ;
 
 void cleanupChartContainers() {
     if (chart_container != NULL) {
-        Serial.println("Hiding chart containers (not deleting)");
+        //Serial.println("Hiding chart containers (not deleting)");
         
         // Just hide them instead of deleting
         lv_obj_add_flag(chart_container, LV_OBJ_FLAG_HIDDEN);
@@ -1205,7 +1300,7 @@ void cleanupChartContainers() {
 
 void drawGenericChart() {
     if (ui_Chart1 == NULL) {
-        Serial.println("ERROR: ui_Chart1 is NULL");
+        //Serial.println("ERROR: ui_Chart1 is NULL");
         return;
     }
     
@@ -1238,24 +1333,24 @@ void drawGenericChart() {
     if (chart_container == NULL) {
         needsRedraw = true;
         needsFullRebuild = true;
-        Serial.println("First draw - creating containers");
+        //Serial.println("First draw - creating containers");
         lastChartType = currentChart.dataType;
         lastChartSensor = currentChart.sensorIndex;
     }
     else if (lastChartType != currentChart.dataType || lastChartSensor != currentChart.sensorIndex) {
         needsRedraw = true;
         needsFullRebuild = true;
-        Serial.println("Chart type/sensor changed - full rebuild");
+        //Serial.println("Chart type/sensor changed - full rebuild");
         lastChartType = currentChart.dataType;
         lastChartSensor = currentChart.sensorIndex;
     }
     else if (lastChartDataCount != currentDataCount) {
         needsRedraw = true;
-        Serial.printf("Data count changed: %d -> %d\n", lastChartDataCount, currentDataCount);
+        //Serial.printf("Data count changed: %d -> %d\n", lastChartDataCount, currentDataCount);
     }
     else if (millis() - lastChartUpdate > 5000) {
         needsRedraw = true;
-        Serial.println("Periodic update (5s)");
+        //Serial.println("Periodic update (5s)");
     }
     
     if (!needsRedraw) {
@@ -1265,11 +1360,11 @@ void drawGenericChart() {
     lastChartUpdate = millis();
     lastChartDataCount = currentDataCount;
     
-    Serial.printf("Drawing chart: type=%d, sensor=%d\n", currentChart.dataType, currentChart.sensorIndex);
+    //Serial.printf("Drawing chart: type=%d, sensor=%d\n", currentChart.dataType, currentChart.sensorIndex);
     
     // Clean up containers if rebuilding
     if (needsFullRebuild && chart_container != NULL) {
-        Serial.println("Deleting old containers for rebuild");
+        //Serial.println("Deleting old containers for rebuild");
         lv_obj_del(chart_container);
         chart_container = NULL;
         chart_scale_y = NULL;
@@ -1284,7 +1379,7 @@ void drawGenericChart() {
     
     // Create containers if needed
     if (chart_container == NULL) {
-        Serial.println("Creating chart scale containers");
+        //Serial.println("Creating chart scale containers");
         
         lv_obj_update_layout(screen);
         lv_obj_update_layout(ui_Chart1);
@@ -1297,10 +1392,10 @@ void drawGenericChart() {
         lv_coord_t chart_w = lv_area_get_width(&chart_area);
         lv_coord_t chart_h = lv_area_get_height(&chart_area);
         
-        Serial.printf("Chart position: x=%d, y=%d, w=%d, h=%d\n", chart_x, chart_y, chart_w, chart_h);
+        //Serial.printf("Chart position: x=%d, y=%d, w=%d, h=%d\n", chart_x, chart_y, chart_w, chart_h);
         
         if (chart_w <= 0 || chart_h <= 0 || chart_w < 100 || chart_h < 100) {
-            Serial.println("ERROR: Chart has invalid size - skipping");
+            //Serial.println("ERROR: Chart has invalid size - skipping");
             return;
         }
         
@@ -1347,10 +1442,10 @@ void drawGenericChart() {
             lv_obj_set_style_pad_all(time_label, 0, 0);
         }
         
-        Serial.println("Containers created");
+        //Serial.println("Containers created");
     } else {
     // Containers exist but might be hidden - show them
-    Serial.println("Showing existing containers");
+    //Serial.println("Showing existing containers");
     lv_obj_clear_flag(chart_container, LV_OBJ_FLAG_HIDDEN);
     if (chart_x_axis_container != NULL) {
         lv_obj_clear_flag(chart_x_axis_container, LV_OBJ_FLAG_HIDDEN);
@@ -1360,7 +1455,7 @@ void drawGenericChart() {
     // Only remove series if chart type or sensor changed
     static bool seriesInitialized = false;
     if (needsFullRebuild) {
-        Serial.println("Removing old series");
+        //Serial.println("Removing old series");
         lv_chart_series_t * ser;
         while ((ser = lv_chart_get_series_next(ui_Chart1, NULL)) != NULL) {
             lv_chart_remove_series(ui_Chart1, ser);
@@ -1371,7 +1466,7 @@ void drawGenericChart() {
     // === WIND SPEED CHART ===
     if (currentChart.dataType == CHART_WIND_SPEED) {
         if (windHistory == nullptr || windHistoryCount == 0) {
-            Serial.println("No wind history data available");
+            //Serial.println("No wind history data available");
             lv_label_set_text(ui_LabelChart, "Wind Speed & Gusts - No Data");
             return;
         }
@@ -1382,7 +1477,7 @@ void drawGenericChart() {
         if (displayPoints > 100) displayPoints = 100;
         if (displayPoints < 2) displayPoints = 2;
         
-        Serial.printf("Wind chart: displayPoints=%d, historyCount=%d\n", displayPoints, windHistoryCount);
+        //Serial.printf("Wind chart: displayPoints=%d, historyCount=%d\n", displayPoints, windHistoryCount);
         
         lv_chart_set_point_count(ui_Chart1, displayPoints);
         
@@ -1408,13 +1503,13 @@ void drawGenericChart() {
             maxVal += 2.0;
         }
         
-        Serial.printf("Wind range: %.1f to %.1f\n", minVal, maxVal);
+        //Serial.printf("Wind range: %.1f to %.1f\n", minVal, maxVal);
         
         lv_chart_series_t * speed_series = lv_chart_get_series_next(ui_Chart1, NULL);
         lv_chart_series_t * gust_series = NULL;
         
         if (!seriesInitialized) {
-            Serial.println("Creating wind series");
+            //Serial.println("Creating wind series");
             speed_series = lv_chart_add_series(ui_Chart1, lv_palette_main(LV_PALETTE_GREEN), LV_CHART_AXIS_PRIMARY_Y);
             gust_series = lv_chart_add_series(ui_Chart1, lv_palette_main(LV_PALETTE_RED), LV_CHART_AXIS_PRIMARY_Y);
             seriesInitialized = true;
@@ -1423,11 +1518,11 @@ void drawGenericChart() {
         }
         
         if (speed_series == NULL || gust_series == NULL) {
-            Serial.println("ERROR: Failed to get/create series");
+            //Serial.println("ERROR: Failed to get/create series");
             return;
         }
         
-        Serial.println("Populating wind data...");
+        //Serial.println("Populating wind data...");
         for (int i = 0; i < displayPoints; i++) {
             int historyIdx;
             if (windHistoryCount <= displayPoints) {
@@ -1485,7 +1580,7 @@ void drawGenericChart() {
                     int idx = (startIdx + dataPoint) % windHistoryCapacity;
                     
                     if (idx >= 0 && idx < windHistoryCapacity) {
-                        time_t timestamp = (time_t)(windHistory[idx].timestamp / 1000);
+                        time_t timestamp = (time_t)windHistory[idx].timestamp;
                         
                         if (timestamp > 0 && timestamp >= 1000000000) {
                             struct tm timeinfo_buf;
@@ -1509,7 +1604,7 @@ void drawGenericChart() {
         }
         
         lv_chart_refresh(ui_Chart1);
-        Serial.println("Wind chart complete");
+        //Serial.println("Wind chart complete");
         return;
     }
     
@@ -1519,7 +1614,7 @@ void drawGenericChart() {
         char titleBuf[64];
         snprintf(titleBuf, sizeof(titleBuf), "%s - Sensor %d - No Data", currentChart.title, sensor + 1);
         lv_label_set_text(ui_LabelChart, titleBuf);
-        Serial.printf("No data for sensor %d\n", sensor);
+        //Serial.printf("No data for sensor %d\n", sensor);
         return;
     }
     
@@ -1531,7 +1626,7 @@ void drawGenericChart() {
     if (displayPoints > 100) displayPoints = 100;
     if (displayPoints < 2) displayPoints = 2;
     
-    Serial.printf("Sensor %d chart: displayPoints=%d, historyCount=%d\n", sensor, displayPoints, sensorHistoryCount[sensor]);
+    //Serial.printf("Sensor %d chart: displayPoints=%d, historyCount=%d\n", sensor, displayPoints, sensorHistoryCount[sensor]);
     
     lv_chart_set_point_count(ui_Chart1, displayPoints);
     
@@ -1564,21 +1659,21 @@ void drawGenericChart() {
         maxVal += 1.0;
     }
     
-    Serial.printf("Sensor range: %.1f to %.1f\n", minVal, maxVal);
+    //Serial.printf("Sensor range: %.1f to %.1f\n", minVal, maxVal);
     
     lv_chart_series_t * series = lv_chart_get_series_next(ui_Chart1, NULL);
     if (!seriesInitialized) {
-        Serial.println("Creating sensor series");
+        //Serial.println("Creating sensor series");
         series = lv_chart_add_series(ui_Chart1, lv_palette_main(LV_PALETTE_BLUE), LV_CHART_AXIS_PRIMARY_Y);
         seriesInitialized = true;
     }
     
     if (series == NULL) {
-        Serial.println("ERROR: Failed to get/create series");
+        //Serial.println("ERROR: Failed to get/create series");
         return;
     }
     
-    Serial.println("Populating sensor data...");
+    //Serial.println("Populating sensor data...");
     for (int i = 0; i < displayPoints; i++) {
         int historyIdx;
         if (sensorHistoryCount[sensor] <= displayPoints) {
@@ -1662,7 +1757,7 @@ void drawGenericChart() {
     }
     
     lv_chart_refresh(ui_Chart1);
-    Serial.println("Sensor chart complete");
+    //Serial.println("Sensor chart complete");
 }
 
 // MODIFIED: New WiFi startup state machine to skip scanning if we have credentials
@@ -1671,7 +1766,7 @@ void handleWifiStartup() {
     
     switch (wifiStartupState) {
         case WIFI_STARTUP_INIT:
-            Serial.println("=== WiFi Startup: Initializing ===");
+            //Serial.println("=== WiFi Startup: Initializing ===");
             
             WiFi.mode(WIFI_AP_STA);
             WiFi.setTxPower(WIFI_POWER_8_5dBm);
@@ -1679,48 +1774,89 @@ void handleWifiStartup() {
             // Initialize SNTP now that WiFi mode is set
             if (!isSetNtp) {
                 initSNTP();
-                Serial.println("SNTP initialized");
+                //Serial.println("SNTP initialized");
             }
             
             // Initialize ESP-NOW now that WiFi is initialized
             if (esp_now_init() != ESP_OK) {
-                Serial.println("Error initializing ESP-NOW");
+                //Serial.println("Error initializing ESP-NOW");
             } else {
                 esp_now_register_recv_cb(onESPNowReceive);
-                Serial.println("ESP-NOW initialized");
+                //Serial.println("ESP-NOW initialized");
             }
             
             // Start UDP listener
             udp.begin(UDP_PORT);
-            Serial.printf("UDP listener started on port %d\n", UDP_PORT);
+            //Serial.printf("UDP listener started on port %d\n", UDP_PORT);
             
             wifiStartupState = WIFI_STARTUP_CHECK_CREDS;  // Skip SCAN, go straight to credential check
             wifiStartupStepTime = now;
             break;
+            case WIFI_STARTUP_SCAN:
+    {
+        static bool scanStarted = false;
+        
+        if (!scanStarted) {
+            if (now - wifiStartupStepTime < 1000) break;  // Wait 1s after connection failure
             
-        case WIFI_STARTUP_SCAN:
-            // Wait a bit before scanning
-            if (now - wifiStartupStepTime < 500) break;
-            
-            Serial.println("=== WiFi Startup: Scanning networks ===");
+            //Serial.println("Starting async WiFi scan...");
             consoleLog("Scanning for networks...");
-            lv_timer_handler();  // Update display
+            consoleLog("Select an SSID and enter password.");
+            lv_timer_handler();  // Force UI update
             
-            populateWifiList();
-            
-            wifiStartupState = WIFI_STARTUP_COMPLETE;  // After scan, we're done
+            WiFi.scanDelete();
+            WiFi.scanNetworks(true);  // async
+            scanStarted = true;
             wifiStartupStepTime = now;
             break;
+        }
+        
+        // Wait at least 3 seconds for scan to complete
+        if (now - wifiStartupStepTime < 3000) break;
+        
+        int n = WiFi.scanComplete();
+        //Serial.printf("scanComplete() returned: %d\n", n);
+        
+        if (n == WIFI_SCAN_RUNNING) {
+            break;  // Still running, keep waiting
+        }
+        
+        if (n <= 0) {
+            // Scan failed or no networks - try again
+            //Serial.println("Scan failed or no networks, retrying...");
+            consoleLog("No networks found, retrying...");
+            lv_timer_handler();
+            WiFi.scanDelete();
+            WiFi.scanNetworks(true);
+            wifiStartupStepTime = now;
+            break;
+        }
+        
+        // Success
+        scanStarted = false;
+        if (ui_DropdownSSID != NULL) {
+            String options = "";
+            for (int i = 0; i < n; i++) {
+                if (i > 0) options += "\n";
+                options += WiFi.SSID(i);
+                //Serial.printf("  Network %d: %s\n", i, WiFi.SSID(i).c_str());
+            }
+            lv_dropdown_set_options(ui_DropdownSSID, options.c_str());
+            //Serial.printf("Dropdown populated with %d networks\n", n);
+        }
+        wifiStartupState = WIFI_STARTUP_COMPLETE;
+    }
+    break;
             
         case WIFI_STARTUP_CHECK_CREDS:
             // Wait a bit after init
             if (now - wifiStartupStepTime < 500) break;
             
-            Serial.println("=== WiFi Startup: Checking for saved credentials ===");
+            //Serial.println("=== WiFi Startup: Checking for saved credentials ===");
             
             // Check for saved credentials
             if (loadWifiCredentials(startupSSID, startupPassword)) {
-                Serial.printf("Found saved credentials: SSID='%s'\n", startupSSID.c_str());
+                //Serial.printf("Found saved credentials: SSID='%s'\n", startupSSID.c_str());
                 
                 consoleLog("Found saved credentials!");
                 lv_timer_handler();  // Update display
@@ -1730,13 +1866,17 @@ void handleWifiStartup() {
                 consoleLog(logBuf);
                 lv_timer_handler();  // Update display
                 
-                consoleLog("Connecting to WiFi...");
-                lv_timer_handler();  // Update display
+                    char logBuf2[128];
+                    snprintf(logBuf2, sizeof(logBuf2), "Connecting to: %s", startupSSID.c_str());
+                    consoleLog(logBuf2);
+                    snprintf(logBuf2, sizeof(logBuf2), "Timeout: %ds", WIFI_CONNECT_TIMEOUT / 1000);
+                    consoleLog(logBuf2);
+                    lv_timer_handler();
                 
                 delay(500);  // Brief pause so user can see the messages
                 
                 // Start connection attempt
-                Serial.printf("Starting WiFi.begin('%s', '***')\n", startupSSID.c_str());
+                //Serial.printf("Starting WiFi.begin('%s', '***')\n", startupSSID.c_str());
                 WiFi.begin(startupSSID.c_str(), startupPassword.c_str());
                 wifiConnecting = true;
                 wifiConnectStartTime = now;
@@ -1745,8 +1885,9 @@ void handleWifiStartup() {
                 wifiStartupState = WIFI_STARTUP_CONNECTING;
                 wifiStartupStepTime = now;
             } else {
-                Serial.println("No saved WiFi credentials found - will scan networks");
-                consoleLog("No saved credentials");
+                //Serial.println("No saved WiFi credentials found - will scan networks");
+                consoleLog("No saved credentials.");
+                consoleLog("Select an SSID and enter password.");
                 lv_timer_handler();
                 
                 // No credentials - scan networks now
@@ -1755,24 +1896,23 @@ void handleWifiStartup() {
             }
             break;
             
-        case WIFI_STARTUP_CONNECTING:
-            // checkWifiConnection() handles the actual connection monitoring
-            // We just need to detect when it's done
-            if (!wifiConnecting) {
-                // Connection attempt finished (success or failure)
-                if (WiFi.status() == WL_CONNECTED) {
-                    // Success - we're done
-                    wifiStartupState = WIFI_STARTUP_COMPLETE;
-                } else {
-                    // Failed - scan networks so user can try again
-                    Serial.println("Connection failed - scanning networks for manual selection");
-                    consoleLog("Connection failed");
-                    lv_timer_handler();
-                    wifiStartupState = WIFI_STARTUP_SCAN;
-                    wifiStartupStepTime = now;
-                }
-            }
-            break;
+case WIFI_STARTUP_CONNECTING:
+    if (!wifiConnecting) {
+        if (WiFi.status() == WL_CONNECTED) {
+            wifiStartupState = WIFI_STARTUP_COMPLETE;
+        } else {
+            //Serial.println("Connection failed - scanning networks");
+            consoleLog("Connection failed.");
+            consoleLog("Select an SSID and enter password.");
+            lv_timer_handler();
+            // Ensure WiFi is fully disconnected before scanning
+            WiFi.disconnect(true);  // true = clear saved AP
+            delay(500);
+            wifiStartupState = WIFI_STARTUP_SCAN;
+            wifiStartupStepTime = now;
+        }
+    }
+    break;
             
         case WIFI_STARTUP_COMPLETE:
             // Nothing to do - startup complete
@@ -1814,7 +1954,7 @@ void handleUDP() {
         uint8_t buffer[256];
         int len = udp.read(buffer, sizeof(buffer));
         
-        Serial.printf("UDP packet received: %d bytes\n", len);
+        //Serial.printf("UDP packet received: %d bytes\n", len);
         
         // Check for temperature sensor data
         if (len == sizeof(temp_sensor_payload_t)) {
@@ -1827,24 +1967,24 @@ void handleUDP() {
                 
                 // Check if sensor_id is valid
                 if (payload.sensor_id >= NUM_SENSORS) {
-                    Serial.printf("Invalid sensor_id: %d (max: %d)\n", payload.sensor_id, NUM_SENSORS - 1);
+                    //Serial.printf("Invalid sensor_id: %d (max: %d)\n", payload.sensor_id, NUM_SENSORS - 1);
                     return;
                 }
                 
                 // Check for duplicate within 2 seconds
                 unsigned long now = millis();
                 if ((now - lastTempMsgTime[payload.sensor_id]) < DUPLICATE_REJECT_MS) {
-                    Serial.printf("Duplicate TEMP packet from sensor %d rejected (%.1fs since last)\n", 
-                                  payload.sensor_id, 
-                                  (now - lastTempMsgTime[payload.sensor_id]) / 1000.0);
+                    //Serial.printf("Duplicate TEMP packet from sensor %d rejected (%.1fs since last)\n", 
+                                //  payload.sensor_id, 
+                                 // (now - lastTempMsgTime[payload.sensor_id]) / 1000.0);
                     return;
                 }
                 
                 // Update last message time
                 lastTempMsgTime[payload.sensor_id] = now;
                 
-                Serial.printf("Sensor %d: Temp=%.2f°C, Hum=%.1f%%, Pres=%.1fmbar\n", 
-                              payload.sensor_id, payload.temp, payload.hum, payload.pres);
+                //Serial.printf("Sensor %d: Temp=%.2f°C, Hum=%.1f%%, Pres=%.1fmbar\n", 
+                             // payload.sensor_id, payload.temp, payload.hum, payload.pres);
                 
                 addTempToHistory(payload.sensor_id, payload.temp, payload.hum, payload.pres);
             }
@@ -1861,17 +2001,17 @@ void handleUDP() {
                 // Check for duplicate within 2 seconds
                 unsigned long now = millis();
                 if ((now - lastWindMsgTime) < DUPLICATE_REJECT_MS) {
-                    Serial.printf("Duplicate WIND packet rejected (%.1fs since last)\n", 
-                                  (now - lastWindMsgTime) / 1000.0);
+                    //Serial.printf("Duplicate WIND packet rejected (%.1fs since last)\n", 
+                                 // (now - lastWindMsgTime) / 1000.0);
                     return;
                 }
                 
                 // Update last message time
                 lastWindMsgTime = now;
                 
-                Serial.printf("Wind Sensor: Speed=%.1fkph, Dir=%.1f, Gust=%.1fkph, AvgWin=%.1fs, GustWin=%.1fs\n", 
-                              payload.avgwind, payload.winddirV, payload.windgust, 
-                              payload.avgWindow, payload.gustWindow);
+                //Serial.printf("Wind Sensor: Speed=%.1fkph, Dir=%.1f, Gust=%.1fkph, AvgWin=%.1fs, GustWin=%.1fs\n", 
+                            //  payload.avgwind, payload.winddirV, payload.windgust, 
+                            //  payload.avgWindow, payload.gustWindow);
                 
                 s2windgust = payload.windgust;
                 
@@ -1884,8 +2024,8 @@ void handleUDP() {
                     if (ui_Spinbox1 != NULL && ui_Spinbox2 != NULL) {
                         lv_spinbox_set_value(ui_Spinbox1, (int32_t)currentAvgWindow);
                         lv_spinbox_set_value(ui_Spinbox2, (int32_t)currentGustWindow);
-                        Serial.printf("Updated spinboxes: Avg=%.1f, Gust=%.1f\n", 
-                                      currentAvgWindow, currentGustWindow);
+                        //Serial.printf("Updated spinboxes: Avg=%.1f, Gust=%.1f\n", 
+                                     // currentAvgWindow, currentGustWindow);
                     }
                 }
                 
@@ -1899,12 +2039,12 @@ void handleUDP() {
                         lastTempMsgTime[payload.sensor_id] = now;
                         addTempToHistory(payload.sensor_id, payload.temp, payload.hum, payload.pres);
                     } else {
-                        Serial.printf("Wind sensor temp data for sensor %d skipped (duplicate)\n", payload.sensor_id);
+                        //Serial.printf("Wind sensor temp data for sensor %d skipped (duplicate)\n", payload.sensor_id);
                     }
                 }
             }
         } else {
-            Serial.printf("Unknown packet size: %d bytes\n", len);
+            //Serial.printf("Unknown packet size: %d bytes\n", len);
         }
     }
 }
@@ -1920,7 +2060,7 @@ void onESPNowReceive(const esp_now_recv_info_t * info, const uint8_t *data, int 
     if (request.magic[0] == 0xDE && request.magic[1] == 0xAD &&
         request.magic[2] == 0xBE && request.magic[3] == 0xEF) {
       
-      Serial.println("Received credential request!");
+      //Serial.println("Received credential request!");
       
       // Get current WiFi credentials
       String ssid = WiFi.SSID();
@@ -1952,12 +2092,12 @@ void onESPNowReceive(const esp_now_recv_info_t * info, const uint8_t *data, int 
         esp_err_t result = esp_now_send(peerMAC, (uint8_t *)&creds, sizeof(creds));
         
         if (result == ESP_OK) {
-          Serial.printf("Sent credentials to sensor: %s\n", ssid.c_str());
+          //Serial.printf("Sent credentials to sensor: %s\n", ssid.c_str());
         } else {
-          Serial.printf("Failed to send credentials: %d\n", result);
+          //Serial.printf("Failed to send credentials: %d\n", result);
         }
       } else {
-        Serial.println("No WiFi credentials to send");
+        //Serial.println("No WiFi credentials to send");
       }
     }
   }
@@ -1971,8 +2111,8 @@ lv_color_t *disp_draw_buf;
 
 void my_print(lv_log_level_t level, const char *buf) {
     LV_UNUSED(level);
-    Serial.println(buf);
-    Serial.flush();
+    //Serial.println(buf);
+    //Serial.flush();
 }
 
 uint32_t millis_cb(void) {
@@ -2039,7 +2179,7 @@ void drawWindRose() {
             lv_obj_set_style_pad_all(wind_rose_canvas, 0, 0);
             buf_initialized = true;
         } else {
-            Serial.println("Failed to allocate canvas buffer");
+            //Serial.println("Failed to allocate canvas buffer");
             return;
         }
     }
@@ -2123,95 +2263,90 @@ void drawWindRose() {
 // ============================================
 
 extern "C" void populateWifiList() {
-	if (ui_DropdownSSID == NULL) return;
-	
-	Serial.println("Scanning for WiFi networks...");
-	int n = WiFi.scanNetworks();
-	
-	if (n == 0) {
-		lv_dropdown_set_options(ui_DropdownSSID, "No networks found");
-		Serial.println("No WiFi networks found");
-		return;
-	}
-	
-	// Build dropdown string with all SSIDs
-	String options = "";
-	for (int i = 0; i < n; i++) {
-		if (i > 0) options += "\n";
-		options += WiFi.SSID(i);
-		
-		// Log SSID and signal strength
-		Serial.printf("%d: %s (%d dBm)\n", i, WiFi.SSID(i).c_str(), WiFi.RSSI(i));
-	}
-	
-	lv_dropdown_set_options(ui_DropdownSSID, options.c_str());
-	Serial.printf("Found %d networks\n", n);
+    if (ui_DropdownSSID == NULL) return;
+    
+    lv_dropdown_set_options(ui_DropdownSSID, "Scanning...");
+    lv_timer_handler();
+    
+    // Cancel any running scan first
+    WiFi.scanDelete();
+    delay(100);
+    
+    int n = WiFi.scanNetworks(); // blocking is fine here since user initiated
+    
+    if (n <= 0) {
+        lv_dropdown_set_options(ui_DropdownSSID, "No networks found");
+        return;
+    }
+    
+    String options = "";
+    for (int i = 0; i < n; i++) {
+        if (i > 0) options += "\n";
+        options += WiFi.SSID(i);
+    }
+    lv_dropdown_set_options(ui_DropdownSSID, options.c_str());
 }
 
-// Modify the SaveWifiFromUI function
 extern "C" void SaveWifiFromUI(lv_event_t * e)
 {
-    Serial.println("=== SaveWifiFromUI called ===");
+    //Serial.println("=== SaveWifiFromUI called ===");
     
     if (ui_DropdownSSID == NULL || ui_TextAreaPassword == NULL) {
         consoleLog("ERROR: WiFi UI elements not found");
-        Serial.println("ERROR: ui_DropdownSSID or ui_TextAreaPassword is NULL");
         return;
     }
     
     // Clear console
     lv_label_set_text(ui_LabelConsole, "");
+    lv_timer_handler();
     
-    // Get selected SSID from dropdown
+    // Get selected SSID
     char ssidBuffer[33];
     memset(ssidBuffer, 0, sizeof(ssidBuffer));
     lv_dropdown_get_selected_str(ui_DropdownSSID, ssidBuffer, sizeof(ssidBuffer));
     
-    Serial.printf("Selected SSID from dropdown: '%s'\n", ssidBuffer);
-    
-    // Get password from text area
+    // Get password
     const char* password = lv_textarea_get_text(ui_TextAreaPassword);
-    
-    Serial.printf("Password from text area: '%s'\n", password);
-    Serial.printf("Password length: %d\n", strlen(password));
-    
-    consoleLog("Saving WiFi credentials...");
     
     char logBuf[128];
     snprintf(logBuf, sizeof(logBuf), "SSID: %s", ssidBuffer);
     consoleLog(logBuf);
-    
-    snprintf(logBuf, sizeof(logBuf), "Password length: %d chars", strlen(password));
+    snprintf(logBuf, sizeof(logBuf), "Password: %d chars", (int)strlen(password));
     consoleLog(logBuf);
+    snprintf(logBuf, sizeof(logBuf), "Timeout: %ds", WIFI_CONNECT_TIMEOUT / 1000);
+    consoleLog(logBuf);
+    lv_timer_handler();
     
-    // Save to Preferences (persistent storage)
+    // Save credentials to flash
     Preferences preferences;
     preferences.begin("wifi", false);
     preferences.putString("ssid", ssidBuffer);
     preferences.putString("password", password);
     preferences.end();
-    
-    Serial.println("Credentials saved to Preferences");
-    consoleLog("Credentials saved to flash");
+    consoleLog("Credentials saved to flash.");
+    lv_timer_handler();
     
     // Disconnect if already connected
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("Disconnecting from current WiFi");
         WiFi.disconnect();
-        delay(100);
+        delay(200);
     }
     
-    // Set flags to attempt connection (manual mode, don't auto-switch screens)
+    // Start connection attempt
     wifiConnecting = true;
     wifiConnectStartTime = millis();
-    autoConnectMode = false;  // Manual connection via UI
+    autoConnectMode = false;  // Manual - checkWifiConnection will handle screen switch on success
     
-    // Attempt to connect
-    Serial.printf("Calling WiFi.begin('%s', '%s')\n", ssidBuffer, password);
-    WiFi.begin(ssidBuffer, password);
+    // Reset countdown timer so first log line shows immediately
+    lastCountdown = 0;
+    
     consoleLog("Connecting to WiFi...");
+    lv_timer_handler();
     
-    Serial.println("=== SaveWifiFromUI complete ===");
+    WiFi.begin(ssidBuffer, password);
+    
+    //Serial.printf("WiFi.begin('%s') called\n", ssidBuffer);
+    //Serial.println("=== SaveWifiFromUI complete ===");
 }
 
 
@@ -2233,14 +2368,21 @@ void updateBacklight() {
     } else {
         brightness = brightnessOffset * 16;
     }
-    ledcWrite(GFX_BL, clampInt(brightness, 0, BL_MAX));
+    brightness = clampInt(brightness, 0, BL_MAX);
+    
+    // Only start a new fade if one isn't already in progress
+    if (!isFading) {
+        isFading = true;
+        fadeStartTime = millis();
+        ledcFade(GFX_BL, ledcRead(GFX_BL), brightness, FADE_DURATION_MS);
+    }
 }
 
 
 
 void setup() {
-  Serial.begin(115200);
-  Serial.println("Starting...");
+  //Serial.begin(115200);
+  //Serial.println("Starting...");
   
   _calibrationParams.vaneADCValues[WMK_ANGLE_0_0] = SFE_WMK_ADC_ANGLE_0_0;
   _calibrationParams.vaneADCValues[WMK_ANGLE_22_5] = SFE_WMK_ADC_ANGLE_22_5;
@@ -2280,7 +2422,7 @@ void setup() {
   if (psramFound()) {
     tempHistory = (TempDataPoint*)ps_malloc(TEMP_HISTORY_SIZE * sizeof(TempDataPoint));
     if (tempHistory == nullptr) {
-      Serial.println("Failed to allocate PSRAM for temperature history - using SRAM fallback");
+      //Serial.println("Failed to allocate PSRAM for temperature history - using SRAM fallback");
       tempHistory = tempHistoryFallback;
       tempHistoryCapacity = TEMP_FALLBACK_SIZE;
       for (int i = 0; i < tempHistoryCapacity; i++) {
@@ -2288,7 +2430,7 @@ void setup() {
         tempHistory[i].timestamp = 0;
       }
     } else {
-      Serial.println("Temperature history allocated in PSRAM");
+      //Serial.println("Temperature history allocated in PSRAM");
       tempHistoryCapacity = TEMP_HISTORY_SIZE;
       for (int i = 0; i < tempHistoryCapacity; i++) {
         tempHistory[i].temp = 0.0;
@@ -2298,7 +2440,7 @@ void setup() {
     
     windHistory = (WindDataPoint*)ps_malloc(WIND_HISTORY_SIZE * sizeof(WindDataPoint));
     if (windHistory == nullptr) {
-      Serial.println("Failed to allocate PSRAM for wind history - using SRAM fallback");
+      //Serial.println("Failed to allocate PSRAM for wind history - using SRAM fallback");
       windHistory = windHistoryFallback;
       windHistoryCapacity = WIND_HISTORY_FALLBACK_SIZE;
       for (int i = 0; i < windHistoryCapacity; i++) {
@@ -2307,7 +2449,7 @@ void setup() {
         windHistory[i].timestamp = 0;
       }
     } else {
-      Serial.println("Wind history allocated in PSRAM");
+      //Serial.println("Wind history allocated in PSRAM");
       windHistoryCapacity = WIND_HISTORY_SIZE;
       for (int i = 0; i < windHistoryCapacity; i++) {
         windHistory[i].speed = 0.0;
@@ -2328,7 +2470,7 @@ void setup() {
       }
     }
   } else {
-    Serial.println("PSRAM not found! Using SRAM fallbacks.");
+    //Serial.println("PSRAM not found! Using SRAM fallbacks.");
     tempHistory = tempHistoryFallback;
     tempHistoryCapacity = TEMP_FALLBACK_SIZE;
     for (int i = 0; i < tempHistoryCapacity; i++) {
@@ -2349,7 +2491,7 @@ void setup() {
   }
   
     if (!gfx->begin()) {
-        Serial.println("× gfx->begin() failed!");
+        //Serial.println("× gfx->begin() failed!");
         while (true);
     }
     gfx->invertDisplay(false);
@@ -2358,14 +2500,15 @@ void setup() {
 
     // Set up PWM for backlight (ESP Arduino Core v3.x API)
     ledcAttach(GFX_BL, BL_PWM_FREQ, BL_PWM_RESOLUTION);
-    ledcWrite(GFX_BL, BL_MAX);  // Full brightness on startup
+    ledcWrite(GFX_BL, BL_MAX);  // Full brightness on startup (immediate, no fade needed)
+    isFading = false;  // Clear fade flag
 
     // Initialize secondary I2C bus for BH1750
     I2C_BH1750.begin(17, 18);   // SDA=17, SCL=18
     if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &I2C_BH1750)) {
-        Serial.println("BH1750 initialized on secondary I2C bus (SDA=17, SCL=18)");
+        //Serial.println("BH1750 initialized on secondary I2C bus (SDA=17, SCL=18)");
     } else {
-        Serial.println("BH1750 init failed - check wiring on pins 17/18");
+        //Serial.println("BH1750 init failed - check wiring on pins 17/18");
     }
 
     gfx->fillScreen(RGB565_BLACK);
@@ -2389,7 +2532,7 @@ void setup() {
         disp_draw_buf = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_8BIT);
 
     if (!disp_draw_buf) {
-        Serial.println("× LVGL disp_draw_buf allocation failed!");
+        //Serial.println("× LVGL disp_draw_buf allocation failed!");
         while (true);
     }
 
@@ -2409,17 +2552,20 @@ void setup() {
     lv_timer_handler();
     delay(100);
     
-    Serial.println("UI initialized, starting WiFi setup...");
+    //Serial.println("UI initialized, starting WiFi setup...");
     
     // Don't do ANY WiFi/network setup here - let the state machine handle it
     // Just initialize the state machine
     wifiStartupState = WIFI_STARTUP_INIT;
     wifiStartupStepTime = millis();
     loadSettings();
+    isFading = false;  // Ensure fade flag is clear after settings load
 
     // Apply initial brightness (before first BH1750 read)
     if (!autoBrightness) {
-        ledcWrite(GFX_BL, clampInt(brightnessOffset * 16, 0, BL_MAX));
+        int brightness = clampInt(brightnessOffset * 16, 0, BL_MAX);
+        ledcWrite(GFX_BL, brightness);  // Initial set, no fade needed
+        isFading = false;  // Clear fade flag
     }
 
     // Conditionally init Blynk
@@ -2432,6 +2578,12 @@ void setup() {
 void loop() {
     // CRITICAL: Handle LVGL first
     lv_timer_handler();
+    
+    // Clear fade flag if fade has completed (timeout-based)
+    if (isFading && (millis() - fadeStartTime >= FADE_DURATION_MS)) {
+        isFading = false;
+    }
+    
     // Detect screen changes and cleanup
  
     // Handle WiFi startup state machine
@@ -2462,16 +2614,16 @@ void loop() {
         lv_obj_t * curr_screen = lv_screen_active();
         
         if (prev_screen != curr_screen) {
-            Serial.printf("Screen changed: %p -> %p\n", prev_screen, curr_screen);
+            //Serial.printf("Screen changed: %p -> %p\n", prev_screen, curr_screen);
             screen_change_time = millis();
             
             if (prev_screen == ui_ScreenChart && curr_screen != ui_ScreenChart) {
-                Serial.println("Leaving chart screen - cleanup");
+                //Serial.println("Leaving chart screen - cleanup");
                 cleanupChartContainers();
             }
             
             if (curr_screen == ui_ScreenChart && prev_screen != ui_ScreenChart) {
-                Serial.println("Entering chart screen - will initialize");
+                //Serial.println("Entering chart screen - will initialize");
             }
             
             prev_screen = curr_screen;
@@ -2479,11 +2631,11 @@ void loop() {
         
         // Only draw if on chart screen and stable
         if (curr_screen == ui_ScreenChart && (millis() - screen_change_time > 500)) {
-            Serial.println("About to call drawGenericChart()");
+            //Serial.println("About to call drawGenericChart()");
             unsigned long start = millis();
             drawGenericChart();
             unsigned long duration = millis() - start;
-            Serial.printf("drawGenericChart() took %lu ms\n", duration);
+            //Serial.printf("drawGenericChart() took %lu ms\n", duration);
         }
     }
     

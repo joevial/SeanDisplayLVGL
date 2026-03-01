@@ -19,6 +19,7 @@ lv_obj_t * ui_Label8 = NULL;
 lv_obj_t * ui_Label12 = NULL;
 lv_obj_t * ui_Spinbox1 = NULL;
 lv_obj_t * ui_Spinbox2 = NULL;
+lv_obj_t * ui_Spinbox4 = NULL;
 lv_obj_t * ui_Button5 = NULL;
 lv_obj_t * ui_Button1 = NULL;
 lv_obj_t * ui_Button2 = NULL;
@@ -42,7 +43,6 @@ lv_obj_t * ui_Label31 = NULL;
 lv_obj_t * ui_Label32 = NULL;
 lv_obj_t * ui_Label33 = NULL;
 lv_obj_t * ui_Label34 = NULL;
-lv_obj_t * ui_Spinbox4 = NULL;
 lv_obj_t * ui_Label35 = NULL;
 lv_obj_t * ui_Switch2 = NULL;
 lv_obj_t * ui_Label36 = NULL;
@@ -53,6 +53,12 @@ lv_obj_t * ui_Label38 = NULL;
 lv_obj_t * ui_Label39 = NULL;
 lv_obj_t * ui_Spinbox5 = NULL;
 lv_obj_t * ui_Label40 = NULL;
+lv_obj_t * ui_Label41 = NULL;
+lv_obj_t * ui_Switch3 = NULL;
+lv_obj_t * ui_Label42 = NULL;
+lv_obj_t * ui_Label43 = NULL;
+lv_obj_t * ui_Dropdown1 = NULL;
+lv_obj_t * ui_Label44 = NULL;
 // event funtions
 void ui_event_ButtonReturn(lv_event_t * e)
 {
@@ -196,8 +202,8 @@ void ui_event_Button10(lv_event_t * e)
         _ui_spinbox_step(ui_Spinbox5, 1);
     }
 }
+
 // build funtions
-// Live brightness preview callbacks
 void ui_event_Switch1(lv_event_t * e)
 {
     lv_event_code_t event_code = lv_event_get_code(e);
@@ -227,8 +233,6 @@ static void ui_ScreenSettings_on_loaded(lv_event_t * e)
         applySettingsToUI();
     }
 }
-
-
 void ui_ScreenSettings_screen_init(void)
 {
     ui_ScreenSettings = lv_obj_create(NULL);
@@ -348,6 +352,22 @@ void ui_ScreenSettings_screen_init(void)
     lv_obj_set_style_pad_bottom(ui_Spinbox2, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_align(ui_Spinbox2, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(ui_Spinbox2, &ui_font_Font12, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    ui_Spinbox4 = lv_spinbox_create(ui_ScreenSettings);
+    lv_obj_set_width(ui_Spinbox4, 40);
+    lv_obj_set_height(ui_Spinbox4, 16);
+    lv_obj_set_x(ui_Spinbox4, -400);
+    lv_obj_set_y(ui_Spinbox4, 130);
+    lv_obj_set_align(ui_Spinbox4, LV_ALIGN_TOP_RIGHT);
+    lv_spinbox_set_digit_format(ui_Spinbox4, 3, 2);
+    lv_spinbox_set_range(ui_Spinbox4, -999, 999);
+    lv_spinbox_set_cursor_pos(ui_Spinbox4, 1 - 1);
+    lv_obj_set_style_pad_left(ui_Spinbox4, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_right(ui_Spinbox4, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_top(ui_Spinbox4, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_bottom(ui_Spinbox4, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_align(ui_Spinbox4, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_text_font(ui_Spinbox4, &ui_font_Font12, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_Button5 = lv_button_create(ui_ScreenSettings);
     lv_obj_set_width(ui_Button5, 31);
@@ -529,7 +549,7 @@ void ui_ScreenSettings_screen_init(void)
     ui_Label31 = lv_label_create(ui_ScreenSettings);
     lv_obj_set_width(ui_Label31, LV_SIZE_CONTENT);   /// 1
     lv_obj_set_height(ui_Label31, LV_SIZE_CONTENT);    /// 1
-    lv_obj_set_x(ui_Label31, -19);
+    lv_obj_set_x(ui_Label31, -20);
     lv_obj_set_y(ui_Label31, -48);
     lv_obj_set_align(ui_Label31, LV_ALIGN_CENTER);
     lv_label_set_text(ui_Label31, "+");
@@ -561,22 +581,6 @@ void ui_ScreenSettings_screen_init(void)
     lv_obj_set_align(ui_Label34, LV_ALIGN_CENTER);
     lv_label_set_text(ui_Label34, "-");
     lv_obj_set_style_text_font(ui_Label34, &lv_font_montserrat_34, LV_PART_MAIN | LV_STATE_DEFAULT);
-
-    ui_Spinbox4 = lv_spinbox_create(ui_ScreenSettings);
-    lv_obj_set_width(ui_Spinbox4, 40);
-    lv_obj_set_height(ui_Spinbox4, 16);
-    lv_obj_set_x(ui_Spinbox4, -400);
-    lv_obj_set_y(ui_Spinbox4, 130);
-    lv_obj_set_align(ui_Spinbox4, LV_ALIGN_TOP_RIGHT);
-    lv_spinbox_set_digit_format(ui_Spinbox4, 3, 2);
-    lv_spinbox_set_range(ui_Spinbox4, -999, 999);
-    lv_spinbox_set_cursor_pos(ui_Spinbox4, 1 - 1);
-    lv_obj_set_style_pad_left(ui_Spinbox4, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_right(ui_Spinbox4, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_top(ui_Spinbox4, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_bottom(ui_Spinbox4, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_align(ui_Spinbox4, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_text_font(ui_Spinbox4, &ui_font_Font12, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_Label35 = lv_label_create(ui_ScreenSettings);
     lv_obj_set_width(ui_Label35, LV_SIZE_CONTENT);   /// 1
@@ -675,6 +679,58 @@ void ui_ScreenSettings_screen_init(void)
     lv_label_set_text(ui_Label40, "Offset:");
     lv_obj_set_style_text_font(ui_Label40, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
 
+    ui_Label41 = lv_label_create(ui_ScreenSettings);
+    lv_obj_set_width(ui_Label41, LV_SIZE_CONTENT);   /// 1
+    lv_obj_set_height(ui_Label41, LV_SIZE_CONTENT);    /// 1
+    lv_obj_set_x(ui_Label41, -184);
+    lv_obj_set_y(ui_Label41, 28);
+    lv_obj_set_align(ui_Label41, LV_ALIGN_CENTER);
+    lv_label_set_text(ui_Label41, "Wind Rose Source");
+    lv_obj_set_style_text_font(ui_Label41, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    ui_Switch3 = lv_switch_create(ui_ScreenSettings);
+    lv_obj_set_width(ui_Switch3, 50);
+    lv_obj_set_height(ui_Switch3, 25);
+    lv_obj_set_x(ui_Switch3, -184);
+    lv_obj_set_y(ui_Switch3, 53);
+    lv_obj_set_align(ui_Switch3, LV_ALIGN_CENTER);
+
+    ui_Label42 = lv_label_create(ui_ScreenSettings);
+    lv_obj_set_width(ui_Label42, LV_SIZE_CONTENT);   /// 1
+    lv_obj_set_height(ui_Label42, LV_SIZE_CONTENT);    /// 1
+    lv_obj_set_x(ui_Label42, -222);
+    lv_obj_set_y(ui_Label42, 53);
+    lv_obj_set_align(ui_Label42, LV_ALIGN_CENTER);
+    lv_label_set_text(ui_Label42, "Avg");
+    lv_obj_set_style_text_font(ui_Label42, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    ui_Label43 = lv_label_create(ui_ScreenSettings);
+    lv_obj_set_width(ui_Label43, LV_SIZE_CONTENT);   /// 1
+    lv_obj_set_height(ui_Label43, LV_SIZE_CONTENT);    /// 1
+    lv_obj_set_x(ui_Label43, -142);
+    lv_obj_set_y(ui_Label43, 54);
+    lv_obj_set_align(ui_Label43, LV_ALIGN_CENTER);
+    lv_label_set_text(ui_Label43, "Gust");
+    lv_obj_set_style_text_font(ui_Label43, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
+
+    ui_Dropdown1 = lv_dropdown_create(ui_ScreenSettings);
+    lv_dropdown_set_options(ui_Dropdown1, "5,10,20,30\n10,20,30,40\n5,10,15,20\n8,16,24,32");
+    lv_obj_set_width(ui_Dropdown1, 150);
+    lv_obj_set_height(ui_Dropdown1, LV_SIZE_CONTENT);    /// 1
+    lv_obj_set_x(ui_Dropdown1, -153);
+    lv_obj_set_y(ui_Dropdown1, 108);
+    lv_obj_set_align(ui_Dropdown1, LV_ALIGN_CENTER);
+    lv_obj_add_flag(ui_Dropdown1, LV_OBJ_FLAG_SCROLL_ON_FOCUS);     /// Flags
+
+    ui_Label44 = lv_label_create(ui_ScreenSettings);
+    lv_obj_set_width(ui_Label44, LV_SIZE_CONTENT);   /// 1
+    lv_obj_set_height(ui_Label44, LV_SIZE_CONTENT);    /// 1
+    lv_obj_set_x(ui_Label44, -159);
+    lv_obj_set_y(ui_Label44, 76);
+    lv_obj_set_align(ui_Label44, LV_ALIGN_CENTER);
+    lv_label_set_text(ui_Label44, "Wind Rose Speed Bins (kph)");
+    lv_obj_set_style_text_font(ui_Label44, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
+
     lv_obj_add_event_cb(ui_ButtonReturn, ui_event_ButtonReturn, LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(ui_ButtonWifi, ui_event_ButtonWifi, LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(ui_Button5, ui_event_Button5, LV_EVENT_ALL, NULL);
@@ -707,6 +763,7 @@ void ui_ScreenSettings_screen_destroy(void)
     ui_Label12 = NULL;
     ui_Spinbox1 = NULL;
     ui_Spinbox2 = NULL;
+    ui_Spinbox4 = NULL;
     ui_Button5 = NULL;
     ui_Button1 = NULL;
     ui_Button2 = NULL;
@@ -730,7 +787,6 @@ void ui_ScreenSettings_screen_destroy(void)
     ui_Label32 = NULL;
     ui_Label33 = NULL;
     ui_Label34 = NULL;
-    ui_Spinbox4 = NULL;
     ui_Label35 = NULL;
     ui_Switch2 = NULL;
     ui_Label36 = NULL;
@@ -741,4 +797,11 @@ void ui_ScreenSettings_screen_destroy(void)
     ui_Label39 = NULL;
     ui_Spinbox5 = NULL;
     ui_Label40 = NULL;
+    ui_Label41 = NULL;
+    ui_Switch3 = NULL;
+    ui_Label42 = NULL;
+    ui_Label43 = NULL;
+    ui_Dropdown1 = NULL;
+    ui_Label44 = NULL;
+
 }
