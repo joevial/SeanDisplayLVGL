@@ -19,7 +19,8 @@
 #include <math.h>
 #include "ui.h"
 // Add these global variables near the top of your file (after includes)
-#define DUPLICATE_REJECT_MS 2000
+// Transmitter sends every 3 seconds; keep reject window comfortably below that.
+#define DUPLICATE_REJECT_MS 1500
 float currentAvgWindow = 60.0;   // Default 60 seconds
 float currentGustWindow = 1.0;   // Default 1 second
 static bool chart_needs_init = false;
@@ -28,7 +29,7 @@ static unsigned long lastCountdown = 0;  // global so SaveWifiFromUI can reset i
 TwoWire I2C_BH1750 = TwoWire(1);   // Use I2C bus #1
 BH1750 lightMeter;
 float windOffsetPercent = 1.0f;   // multiplier applied to wind values (1.0 = no change)
-int   brightnessOffset  = 128;      // raw value from Spinbox3 added to BH1750 result or used as manual
+int   brightnessOffset  = 32;      // raw value from Spinbox3 added to BH1750 result or used as manual
 bool  autoBrightness    = true;   // Switch1
 bool  blynkEnabled      = true;   // Switch2
 bool  blynkWasEnabled   = true;   // track previous state to detect "just turned on"
@@ -209,23 +210,23 @@ enum SFEWeatherMeterKitAnemometerAngles
 };
 
 #define SFE_WIND_VANE_DEGREES_PER_INDEX (360.0f / 16.0f)
-#define SFE_WMK_ADC_ANGLE_0_0 3118
-#define SFE_WMK_ADC_ANGLE_22_5 1526
-#define SFE_WMK_ADC_ANGLE_45_0 1761
-#define SFE_WMK_ADC_ANGLE_67_5 199
-#define SFE_WMK_ADC_ANGLE_90_0 237
-#define SFE_WMK_ADC_ANGLE_112_5 123
-#define SFE_WMK_ADC_ANGLE_135_0 613
-#define SFE_WMK_ADC_ANGLE_157_5 371
-#define SFE_WMK_ADC_ANGLE_180_0 1040
-#define SFE_WMK_ADC_ANGLE_202_5 859
-#define SFE_WMK_ADC_ANGLE_225_0 2451
-#define SFE_WMK_ADC_ANGLE_247_5 2329
-#define SFE_WMK_ADC_ANGLE_270_0 3984
-#define SFE_WMK_ADC_ANGLE_292_5 3290
-#define SFE_WMK_ADC_ANGLE_315_0 3616
-#define SFE_WMK_ADC_ANGLE_337_5 2755
-#define SFE_WMK_ADC_RESOLUTION 12
+#define SFE_WMK_ADC_ANGLE_0_0 20264
+#define SFE_WMK_ADC_ANGLE_22_5 10539
+#define SFE_WMK_ADC_ANGLE_45_0 11966
+#define SFE_WMK_ADC_ANGLE_67_5 2188
+#define SFE_WMK_ADC_ANGLE_90_0 2428
+#define SFE_WMK_ADC_ANGLE_112_5 1721
+#define SFE_WMK_ADC_ANGLE_135_0 4797
+#define SFE_WMK_ADC_ANGLE_157_5 3287
+#define SFE_WMK_ADC_ANGLE_180_0 7466
+#define SFE_WMK_ADC_ANGLE_202_5 6363
+#define SFE_WMK_ADC_ANGLE_225_0 16314
+#define SFE_WMK_ADC_ANGLE_247_5 15526
+#define SFE_WMK_ADC_ANGLE_270_0 24322
+#define SFE_WMK_ADC_ANGLE_292_5 21326
+#define SFE_WMK_ADC_ANGLE_315_0 22844
+#define SFE_WMK_ADC_ANGLE_337_5 18149
+#define SFE_WMK_ADC_RESOLUTION 16
 
 struct SFEWeatherMeterKitCalibrationParams
 {
@@ -1921,8 +1922,79 @@ case WIFI_STARTUP_CONNECTING:
 }
 
 // ============================================
-// UDP Packet Handler
+// Wind + Sensor Accumulator (20-reading buffer)
 // ============================================
+// The wind transmitter sends every 3 seconds.  We collect 20 readings
+// (~60 seconds), then average speed/gust/temp/hum/pres and pick the
+// median of the 20 (already direction-snapped) wind directions before
+// committing one data point to the long-term history.
+#define WIND_ACCUM_SIZE 20
+
+struct WindAccumBuffer {
+    float    speed[WIND_ACCUM_SIZE];
+    float    gust[WIND_ACCUM_SIZE];
+    uint8_t  dirIndex[WIND_ACCUM_SIZE]; // 0-15  (index into 16 directions)
+    float    temp[WIND_ACCUM_SIZE];
+    float    hum[WIND_ACCUM_SIZE];
+    float    pres[WIND_ACCUM_SIZE];
+    int      count;
+} windAccum;
+
+// Snap a raw wind-vane ADC value to the nearest of 16 direction indices (0-15),
+// using the receiver's live user-calibrated table (_calibrationParams).
+// Calibration happens on the receiver only - transmitter sends raw ADC.
+static uint8_t adcToDirectionIndex(uint16_t adcVal) {
+    int16_t closestDiff = 32767;
+    uint8_t closestIdx  = 0;
+    for (uint8_t i = 0; i < WMK_NUM_ANGLES; i++) {
+        int16_t diff = abs((int16_t)_calibrationParams.vaneADCValues[i] - (int16_t)adcVal);
+        if (diff < closestDiff) { closestDiff = diff; closestIdx = i; }
+    }
+    return closestIdx;
+}
+
+// Commit the accumulated 20 readings to history as one averaged data point.
+static void flushWindAccum() {
+    if (windAccum.count == 0) return;
+    int n = windAccum.count;
+
+    // Average speed, gust, temp, hum, pres
+    float sumSpeed = 0, sumGust = 0, sumTemp = 0, sumHum = 0, sumPres = 0;
+    for (int i = 0; i < n; i++) {
+        sumSpeed += windAccum.speed[i];
+        sumGust  += windAccum.gust[i];
+        sumTemp  += windAccum.temp[i];
+        sumHum   += windAccum.hum[i];
+        sumPres  += windAccum.pres[i];
+    }
+    float avgSpeed = sumSpeed / n;
+    float avgGust  = sumGust  / n;
+    float avgTemp  = sumTemp  / n;
+    float avgHum   = sumHum   / n;
+    float avgPres  = sumPres  / n;
+
+    // Median wind direction index (sort the 0-15 indices, pick lower median)
+    uint8_t sortedDir[WIND_ACCUM_SIZE];
+    memcpy(sortedDir, windAccum.dirIndex, n);
+    for (int i = 1; i < n; i++) {
+        uint8_t key = sortedDir[i]; int j = i - 1;
+        while (j >= 0 && sortedDir[j] > key) { sortedDir[j+1] = sortedDir[j]; j--; }
+        sortedDir[j+1] = key;
+    }
+    uint8_t medianDirIdx = sortedDir[n / 2];  // lower median
+    float   medianDir    = medianDirIdx * 22.5f;  // degrees
+
+    // Commit to wind history
+    addWindData(avgSpeed, medianDir, avgGust);
+
+    // Commit to sensor history for sensor 0 (wind station)
+    addTempToHistory(0, avgTemp, avgHum, avgPres);
+
+    // Reset buffer
+    windAccum.count = 0;
+}
+
+// UDP packet handler
 
 // UDP packet structures matching the transmitters
 typedef struct {
@@ -1946,6 +2018,85 @@ typedef struct {
   float gustWindow;     // ADD THIS
   uint8_t magic[4];     // Magic bytes: 0x57, 0x49, 0x4E, 0x44 ("WIND")
 } wind_sensor_payload_t;
+
+// Calibration command to windtransmitter — magic: 0xCA,0x1B,0xCA,0x1B
+typedef struct {
+  uint8_t mode;       // 1 = enter calibration, 0 = exit calibration
+  uint8_t magic[4];
+} calib_command_t;
+
+// ============ WIND VANE CALIBRATION STATE ============
+enum CalibState {
+    CALIB_IDLE,
+    CALIB_WAITING_S,   // printed prompt, waiting for 's'
+    CALIB_DONE
+};
+
+static CalibState calibState = CALIB_IDLE;
+static int calibStep = 0;   // 0..15 = WMK_ANGLE_0_0..WMK_ANGLE_337_5
+static float calibLiveWinddirV = 0.0f;  // updated from incoming UDP during calib
+
+// Angle labels for each step (matching enum order)
+static const char* calibAngleLabels[WMK_NUM_ANGLES] = {
+    "0", "22.5", "45", "67.5", "90", "112.5", "135", "157.5",
+    "180", "202.5", "225", "247.5", "270", "292.5", "315", "337.5"
+};
+
+// Prefs key names for each angle
+static const char* calibPrefKeys[WMK_NUM_ANGLES] = {
+    "cal_0","cal_22","cal_45","cal_67","cal_90","cal_112",
+    "cal_135","cal_157","cal_180","cal_202","cal_225","cal_247",
+    "cal_270","cal_292","cal_315","cal_337"
+};
+
+// Default ADC values (compile-time fallback)
+static const uint16_t calibDefaults[WMK_NUM_ANGLES] = {
+    SFE_WMK_ADC_ANGLE_0_0,   SFE_WMK_ADC_ANGLE_22_5,
+    SFE_WMK_ADC_ANGLE_45_0,  SFE_WMK_ADC_ANGLE_67_5,
+    SFE_WMK_ADC_ANGLE_90_0,  SFE_WMK_ADC_ANGLE_112_5,
+    SFE_WMK_ADC_ANGLE_135_0, SFE_WMK_ADC_ANGLE_157_5,
+    SFE_WMK_ADC_ANGLE_180_0, SFE_WMK_ADC_ANGLE_202_5,
+    SFE_WMK_ADC_ANGLE_225_0, SFE_WMK_ADC_ANGLE_247_5,
+    SFE_WMK_ADC_ANGLE_270_0, SFE_WMK_ADC_ANGLE_292_5,
+    SFE_WMK_ADC_ANGLE_315_0, SFE_WMK_ADC_ANGLE_337_5
+};
+
+// Load one calibration value from prefs (returns saved or default)
+static uint16_t loadCalibValue(int idx) {
+    Preferences p;
+    p.begin("windcalib", true);
+    uint16_t val = p.getUShort(calibPrefKeys[idx], calibDefaults[idx]);
+    p.end();
+    return val;
+}
+
+// Save one calibration value to prefs
+static void saveCalibValue(int idx, uint16_t val) {
+    Preferences p;
+    p.begin("windcalib", false);
+    p.putUShort(calibPrefKeys[idx], val);
+    p.end();
+    // Also update the live calibration params used by getWindDirection()
+    _calibrationParams.vaneADCValues[idx] = val;
+}
+
+// Send calib on/off command to windtransmitter via UDP broadcast
+static void sendCalibCommand(bool enter) {
+    if (!wifiConfigured || WiFi.status() != WL_CONNECTED) return;
+    calib_command_t cmd;
+    cmd.mode = enter ? 1 : 0;
+    cmd.magic[0] = 0xCA; cmd.magic[1] = 0x1B;
+    cmd.magic[2] = 0xCA; cmd.magic[3] = 0x1B;
+    IPAddress broadcastIP = WiFi.localIP();
+    broadcastIP[3] = 255;
+    // Send a few times for reliability
+    for (int i = 0; i < 3; i++) {
+        udp.beginPacket(broadcastIP, UDP_PORT);
+        udp.write((uint8_t*)&cmd, sizeof(cmd));
+        udp.endPacket();
+        delay(20);
+    }
+}
 
 // UPDATE the handleUDP() function's wind packet handler:
 void handleUDP() {
@@ -2015,6 +2166,9 @@ void handleUDP() {
                 
                 s2windgust = payload.windgust;
                 
+                // Capture raw ADC value for calibration live readout
+                calibLiveWinddirV = payload.winddirV;
+                
                 // UPDATE: Store the window settings from transmitter
                 currentAvgWindow = payload.avgWindow;
                 currentGustWindow = payload.gustWindow;
@@ -2024,23 +2178,25 @@ void handleUDP() {
                     if (ui_Spinbox1 != NULL && ui_Spinbox2 != NULL) {
                         lv_spinbox_set_value(ui_Spinbox1, (int32_t)currentAvgWindow);
                         lv_spinbox_set_value(ui_Spinbox2, (int32_t)currentGustWindow);
-                        //Serial.printf("Updated spinboxes: Avg=%.1f, Gust=%.1f\n", 
-                                     // currentAvgWindow, currentGustWindow);
                     }
                 }
-                
-                // Add wind data WITH GUST parameter
-                addWindData(payload.avgwind, getWindDirection(payload.winddirV), payload.windgust);
-                
-                // Also store temp/hum/pres from wind sensor
-                if (payload.sensor_id < NUM_SENSORS) {
-                    // Use separate duplicate check for wind sensor temp data
-                    if ((now - lastTempMsgTime[payload.sensor_id]) >= DUPLICATE_REJECT_MS) {
-                        lastTempMsgTime[payload.sensor_id] = now;
-                        addTempToHistory(payload.sensor_id, payload.temp, payload.hum, payload.pres);
-                    } else {
-                        //Serial.printf("Wind sensor temp data for sensor %d skipped (duplicate)\n", payload.sensor_id);
-                    }
+
+                // Accumulate into the 20-reading buffer.
+                // The transmitter already snapped winddirV to the nearest of 16
+                // directions; we convert it back to a 0-15 index for median calc.
+                int slot = windAccum.count % WIND_ACCUM_SIZE;
+                windAccum.speed[slot]    = payload.avgwind;
+                windAccum.gust[slot]     = payload.windgust;
+                windAccum.dirIndex[slot] = adcToDirectionIndex((uint16_t)payload.winddirV);
+                windAccum.temp[slot]     = payload.temp;
+                windAccum.hum[slot]      = payload.hum;
+                windAccum.pres[slot]     = payload.pres;
+                windAccum.count++;
+
+                // Every 20 readings, flush to long-term history
+                if (windAccum.count % WIND_ACCUM_SIZE == 0) {
+                    windAccum.count = WIND_ACCUM_SIZE; // cap before flush
+                    flushWindAccum();
                 }
             }
         } else {
@@ -2378,6 +2534,112 @@ void updateBacklight() {
     }
 }
 
+WidgetTerminal terminal(V10);
+
+BLYNK_WRITE(V10) {
+  String cmd = param.asStr();
+  cmd.trim();
+
+  // ---- help ----
+  if (cmd == "help") {
+    terminal.println("Commands: help, wifi, calib, listcalib");
+    terminal.flush();
+    return;
+  }
+
+  // ---- wifi ----
+  if (cmd == "wifi") {
+    terminal.print("Connected to: ");
+    terminal.println(WiFi.SSID());
+    terminal.print("IP address: ");
+    terminal.println(WiFi.localIP());
+    terminal.print("Signal strength: ");
+    terminal.print(WiFi.RSSI());
+    terminal.println(" dBm");
+    // Print current local time
+    time_t now = time(nullptr);
+    struct tm* ti = localtime(&now);
+    if (ti != nullptr) {
+      char timeBuf[32];
+      snprintf(timeBuf, sizeof(timeBuf), "Time: %02d:%02d:%02d",
+               ti->tm_hour, ti->tm_min, ti->tm_sec);
+      terminal.println(timeBuf);
+    }
+    terminal.flush();
+    return;
+  }
+
+  // ---- listcalib ----
+  if (cmd == "listcalib") {
+    terminal.println("=== Wind vane calibration values ===");
+    for (int i = 0; i < WMK_NUM_ANGLES; i++) {
+      uint16_t val = loadCalibValue(i);
+      char buf[48];
+      snprintf(buf, sizeof(buf), "%s deg: %u", calibAngleLabels[i], val);
+      terminal.println(buf);
+    }
+    terminal.println("====================================");
+    terminal.flush();
+    return;
+  }
+
+  // ---- calib (start) ----
+  if (cmd == "calib") {
+    if (calibState != CALIB_IDLE) {
+      terminal.println("Already in calibration mode. Type 's' to save current step.");
+      terminal.flush();
+      return;
+    }
+    calibState = CALIB_WAITING_S;
+    calibStep = 0;
+    // Tell windtransmitter to enter fast-transmit mode
+    sendCalibCommand(true);
+    terminal.println("=== Wind Vane Calibration Started ===");
+    terminal.println("Rotate vane to each position, type 's' to save.");
+    terminal.println("-------------------------------------");
+    // Print prompt for step 0
+    uint16_t curVal = loadCalibValue(0);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s deg: %u  <-- type 's' to save", calibAngleLabels[0], curVal);
+    terminal.println(buf);
+    terminal.flush();
+    return;
+  }
+
+  // ---- 's' (save current calibration step) ----
+  if (cmd == "s") {
+    if (calibState != CALIB_WAITING_S) {
+      // Silently ignore stray 's' outside calib mode
+      terminal.flush();
+      return;
+    }
+    // Save current raw ADC reading as new value for this step
+    uint16_t newVal = (uint16_t)calibLiveWinddirV;
+    saveCalibValue(calibStep, newVal);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "new %s deg: %u", calibAngleLabels[calibStep], newVal);
+    terminal.println(buf);
+
+    calibStep++;
+    if (calibStep >= WMK_NUM_ANGLES) {
+      // Done
+      calibState = CALIB_DONE;
+      sendCalibCommand(false);  // tell windtransmitter to exit calib mode
+      terminal.println("-------------------------------------");
+      terminal.println("Calibration complete! Values saved.");
+      calibState = CALIB_IDLE;
+    } else {
+      // Print prompt for next step
+      uint16_t nextVal = loadCalibValue(calibStep);
+      snprintf(buf, sizeof(buf), "%s deg: %u  <-- type 's' to save", calibAngleLabels[calibStep], nextVal);
+      terminal.println(buf);
+    }
+    terminal.flush();
+    return;
+  }
+
+  terminal.flush();
+}
 
 
 void setup() {
@@ -2771,6 +3033,11 @@ void loop() {
         drawWindRose();
     }
     updateBacklight();
+
+    // During calibration: stream live raw ADC wind vane value to V11
+    if (calibState == CALIB_WAITING_S && blynkEnabled) {
+        Blynk.virtualWrite(V11, (int)calibLiveWinddirV);
+    }
   }
 
   every (2000) {
