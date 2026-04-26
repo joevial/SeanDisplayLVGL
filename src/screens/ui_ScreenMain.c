@@ -39,6 +39,7 @@ lv_obj_t * ui_Label6 = NULL;
 lv_obj_t * ui_LabelWind1 = NULL;
 lv_obj_t * ui_Label17 = NULL;
 lv_obj_t * ui_Label21 = NULL;
+lv_obj_t * ui_LabelLast24hrs = NULL;
 // event funtions
 void ui_event_LabelTemp0(lv_event_t * e)
 {
@@ -287,6 +288,8 @@ void ui_ScreenMain_screen_init(void)
     lv_obj_set_align(ui_ButtonSettings, LV_ALIGN_CENTER);
     lv_obj_add_flag(ui_ButtonSettings, LV_OBJ_FLAG_SCROLL_ON_FOCUS);     /// Flags
     lv_obj_remove_flag(ui_ButtonSettings, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
+    lv_obj_set_style_bg_color(ui_ButtonSettings, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(ui_ButtonSettings, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     ui_Label1 = lv_label_create(ui_ScreenMain);
     lv_obj_set_width(ui_Label1, LV_SIZE_CONTENT);   /// 1
@@ -672,6 +675,15 @@ void ui_ScreenMain_screen_init(void)
     lv_label_set_text(ui_Label21, "Gust:");
     lv_obj_set_style_text_font(ui_Label21, &lv_font_montserrat_10, LV_PART_MAIN | LV_STATE_DEFAULT);
 
+    ui_LabelLast24hrs = lv_label_create(ui_ScreenMain);
+    lv_obj_set_width(ui_LabelLast24hrs, LV_SIZE_CONTENT);   /// 1
+    lv_obj_set_height(ui_LabelLast24hrs, LV_SIZE_CONTENT);    /// 1
+    lv_obj_set_x(ui_LabelLast24hrs, -100);
+    lv_obj_set_y(ui_LabelLast24hrs,  -83);
+    lv_obj_set_align(ui_LabelLast24hrs, LV_ALIGN_CENTER);
+    lv_label_set_text(ui_LabelLast24hrs, "Last 24hrs:");
+    lv_obj_set_style_text_font(ui_LabelLast24hrs, &lv_font_montserrat_8, LV_PART_MAIN | LV_STATE_DEFAULT);
+
     lv_obj_add_event_cb(ui_LabelTemp0, ui_event_LabelTemp0, LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(ui_LabelWind, ui_event_LabelWind, LV_EVENT_ALL, NULL);
     lv_obj_add_event_cb(ui_ButtonSettings, ui_event_ButtonSettings, LV_EVENT_ALL, NULL);
@@ -729,5 +741,6 @@ void ui_ScreenMain_screen_destroy(void)
     ui_LabelWind1 = NULL;
     ui_Label17 = NULL;
     ui_Label21 = NULL;
+    ui_LabelLast24hrs = NULL;
 
 }

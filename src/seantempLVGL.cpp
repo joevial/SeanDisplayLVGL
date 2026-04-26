@@ -18,11 +18,13 @@
 #include <Preferences.h>
 #include <math.h>
 #include "ui.h"
+const IPAddress WIND_TX_IP(192, 168, 4, 123);   // seanwindtransmitter
 // Add these global variables near the top of your file (after includes)
 // Transmitter sends every 3 seconds; keep reject window comfortably below that.
+float hourlyModeDirection;
 #define DUPLICATE_REJECT_MS 1500
-float currentAvgWindow = 60.0;   // Default 60 seconds
-float currentGustWindow = 1.0;   // Default 1 second
+float currentAvgWindow = 600.0;  // Default 600 seconds (maximum)
+float currentGustWindow = 3.0;   // Default 3 seconds
 static bool chart_needs_init = false;
 static bool chart_needs_update = false;
 static unsigned long lastCountdown = 0;  // global so SaveWifiFromUI can reset it
@@ -238,7 +240,8 @@ SFEWeatherMeterKitCalibrationParams _calibrationParams;
 // Wind Rose data structures
 #define WIND_DIRECTIONS 16
 #define WIND_SPEED_BINS 5
-#define WIND_HISTORY_SIZE 1440
+// 20 UDP readings × 3 s = 60 s per history entry → 60 entries = ~1 hour
+#define WIND_HISTORY_SIZE 60
 
 struct WindDataPoint {
     float speed;
@@ -305,8 +308,8 @@ void loadSettings() {
     blynkEnabled      = prefs.getBool("blynkOn",    true);
     brightnessOffset  = prefs.getInt ("brightOff",  128);
     int sp4raw        = prefs.getInt ("windOffRaw", 0);
-    int savedAvg      = prefs.getInt ("avgWindow",  60);
-    int savedGust     = prefs.getInt ("gustWindow", 1);
+    int savedAvg      = prefs.getInt ("avgWindow",  600);
+    int savedGust     = prefs.getInt ("gustWindow", 3);
     int savedGamma    = prefs.getInt ("blGamma",    10);
     windRoseUseGust   = prefs.getBool("windRoseUseGust", false);
     windRoseSpeedBinSelection = prefs.getInt("windRoseBinSel", 0);
@@ -598,10 +601,8 @@ extern "C" void sendSliderValuesToWindTransmitter() {
     sliders.magic[2] = 0xEF;
     sliders.magic[3] = 0x12;
 
-    IPAddress broadcastIP = WiFi.localIP();
-    broadcastIP[3] = 255;
-
-    udp.beginPacket(broadcastIP, UDP_PORT);
+IPAddress windTxIP(192, 168, 4, 123);
+udp.beginPacket(windTxIP, UDP_PORT);
     udp.write((uint8_t *)&sliders, sizeof(sliders));
     udp.endPacket();
 
@@ -1149,7 +1150,59 @@ float s1hum, s1pres, s1vBat;
     static uint32_t __every__##interval = millis(); \
     if (millis() - __every__##interval >= interval && (__every__##interval = millis()))
 
+// Function to get the wind rose timeframe string (time difference between now and oldest data)
+void updateWindRoseTimeframeLabel() {
+    if (windHistory == nullptr || windHistoryCount == 0) {
+        lv_label_set_text(ui_LabelLast24hrs, "No data");
+        return;
+    }
+
+    time_t now = time(nullptr);
     
+    // Find the oldest wind data timestamp
+    // If buffer is not full yet, oldest is at index 0
+    // If buffer is full, oldest is at windHistoryIndex (the next position to be overwritten)
+    int oldestIdx;
+    if (windHistoryCount < windHistoryCapacity) {
+        oldestIdx = 0;  // Buffer not full, oldest is first entry
+    } else {
+        oldestIdx = windHistoryIndex;  // Buffer full, oldest is at wrap-around point
+    }
+    
+    unsigned long oldestTimestamp = windHistory[oldestIdx].timestamp;
+    
+    // Validate timestamp (should be > 2020-01-01 in unix time, which is 1577836800)
+    if (oldestTimestamp < 1577836800) {
+        lv_label_set_text(ui_LabelLast24hrs, "Invalid TS");
+        return;
+    }
+    
+    // Calculate time difference in seconds
+    long timeDiffSeconds = (long)(now - oldestTimestamp);
+    
+    if (timeDiffSeconds < 0) {
+        lv_label_set_text(ui_LabelLast24hrs, "Invalid");
+        return;
+    }
+    
+    char buf[32];
+    
+    if (timeDiffSeconds < 60) {
+        // Less than 60 seconds - show as seconds
+        snprintf(buf, sizeof(buf), "Last %lds:", timeDiffSeconds);
+    } else if (timeDiffSeconds < 3600) {
+        // Less than 60 minutes - show as minutes
+        long minutes = timeDiffSeconds / 60;
+        snprintf(buf, sizeof(buf), "Last %ldm:", minutes);
+    } else {
+        // 60 minutes or more - show as hours, rounded up
+        long hours = (timeDiffSeconds + 3599) / 3600;  // Add 3599 to round up
+        snprintf(buf, sizeof(buf), "Last %ldh:", hours);
+    }
+    
+    lv_label_set_text(ui_LabelLast24hrs, buf);
+}
+
 // Update addWindData function signature and implementation
 void addWindData(float speed, float direction, float gust) {
     if (windHistory == nullptr) return;
@@ -1158,9 +1211,12 @@ void addWindData(float speed, float direction, float gust) {
     float adjSpeed = speed * windOffsetPercent;
     float adjGust  = gust  * windOffsetPercent;
 
+    // Correct for backwards-mounted wind vane (180° offset)
+    float adjDirection = fmod(direction + 180.0f, 360.0f);
+
     windHistory[windHistoryIndex].speed     = adjSpeed;
     windHistory[windHistoryIndex].gust      = adjGust;
-    windHistory[windHistoryIndex].direction = direction;
+    windHistory[windHistoryIndex].direction = adjDirection;
     windHistory[windHistoryIndex].timestamp = (unsigned long)time(nullptr);
 
     windHistoryIndex = (windHistoryIndex + 1) % windHistoryCapacity;
@@ -1180,8 +1236,7 @@ void addWindData(float speed, float direction, float gust) {
         // Choose data source: gust if Switch3 is checked, otherwise speed
         float spd = (windRoseUseGust) ? windHistory[idx].gust : windHistory[idx].speed;
         float dir = windHistory[idx].direction;
-        int dirBin = (int)((dir + 11.25f) / 22.5f) % WIND_DIRECTIONS;
-        
+
         // Calculate speed bin based on configured thresholds
         int spdBin;
         if (spd < windRoseSpeedBins[0]) {
@@ -1195,9 +1250,11 @@ void addWindData(float speed, float direction, float gust) {
         } else {
             spdBin = 4;
         }
-        
-        if (windRoseData[dirBin] != nullptr)
-            windRoseData[dirBin][spdBin]++;
+
+        // 16-bin (22.5 deg) rose. Direction from flushWindAccum is always snapped
+        // to a clean 22.5° multiple, so we simply round to the nearest bin.
+        int dirBin = (int)roundf(dir / 22.5f) % WIND_DIRECTIONS;
+        if (windRoseData[dirBin] != nullptr) windRoseData[dirBin][spdBin]++;
     }
 }
 
@@ -1770,7 +1827,7 @@ void handleWifiStartup() {
             //Serial.println("=== WiFi Startup: Initializing ===");
             
             WiFi.mode(WIFI_AP_STA);
-            WiFi.setTxPower(WIFI_POWER_8_5dBm);
+            //WiFi.setTxPower(WIFI_POWER_8_5dBm);
             
             // Initialize SNTP now that WiFi mode is set
             if (!isSetNtp) {
@@ -1933,7 +1990,7 @@ case WIFI_STARTUP_CONNECTING:
 struct WindAccumBuffer {
     float    speed[WIND_ACCUM_SIZE];
     float    gust[WIND_ACCUM_SIZE];
-    uint8_t  dirIndex[WIND_ACCUM_SIZE]; // 0-15  (index into 16 directions)
+    uint8_t  dirIndex[WIND_ACCUM_SIZE]; // 0-15 (index into 16 directions, 22.5° each)
     float    temp[WIND_ACCUM_SIZE];
     float    hum[WIND_ACCUM_SIZE];
     float    pres[WIND_ACCUM_SIZE];
@@ -1958,31 +2015,35 @@ static void flushWindAccum() {
     if (windAccum.count == 0) return;
     int n = windAccum.count;
 
-    // Average speed, gust, temp, hum, pres
-    float sumSpeed = 0, sumGust = 0, sumTemp = 0, sumHum = 0, sumPres = 0;
+    // Average speed, temp, hum, pres; gust = PEAK (max) across the window
+    float sumSpeed = 0, peakGust = 0, sumTemp = 0, sumHum = 0, sumPres = 0;
     for (int i = 0; i < n; i++) {
         sumSpeed += windAccum.speed[i];
-        sumGust  += windAccum.gust[i];
+        if (windAccum.gust[i] > peakGust) peakGust = windAccum.gust[i];
         sumTemp  += windAccum.temp[i];
         sumHum   += windAccum.hum[i];
         sumPres  += windAccum.pres[i];
     }
     float avgSpeed = sumSpeed / n;
-    float avgGust  = sumGust  / n;
+    float avgGust  = peakGust;  // gust = highest gust recorded in this flush window
     float avgTemp  = sumTemp  / n;
     float avgHum   = sumHum   / n;
     float avgPres  = sumPres  / n;
 
-    // Median wind direction index (sort the 0-15 indices, pick lower median)
-    uint8_t sortedDir[WIND_ACCUM_SIZE];
-    memcpy(sortedDir, windAccum.dirIndex, n);
-    for (int i = 1; i < n; i++) {
-        uint8_t key = sortedDir[i]; int j = i - 1;
-        while (j >= 0 && sortedDir[j] > key) { sortedDir[j+1] = sortedDir[j]; j--; }
-        sortedDir[j+1] = key;
+    // Circular mean wind direction over the 20-reading window.
+    // Each dirIndex value (0-15) represents a 22.5° step (0=N, 1=NNE, ..., 15=NNW).
+    // We convert each index to an angle in radians, sum sin and cos components,
+    // then use atan2 to recover the mean angle.
+    float sumSin = 0.0f, sumCos = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float angleRad = windAccum.dirIndex[i] * (2.0f * M_PI / 16.0f);
+        sumSin += sinf(angleRad);
+        sumCos += cosf(angleRad);
     }
-    uint8_t medianDirIdx = sortedDir[n / 2];  // lower median
-    float   medianDir    = medianDirIdx * 22.5f;  // degrees
+    float meanRad = atan2f(sumSin, sumCos);          // result in [-π, π]
+    if (meanRad < 0.0f) meanRad += 2.0f * M_PI;     // normalise to [0, 2π]
+    float medianDir = meanRad * (180.0f / M_PI);     // continuous degrees, e.g. 203.96°
+    if (medianDir >= 360.0f) medianDir -= 360.0f;
 
     // Commit to wind history
     addWindData(avgSpeed, medianDir, avgGust);
@@ -2014,8 +2075,6 @@ typedef struct {
   float winddirV;
   float pres;
   float hum;
-  float avgWindow;      // ADD THIS
-  float gustWindow;     // ADD THIS
   uint8_t magic[4];     // Magic bytes: 0x57, 0x49, 0x4E, 0x44 ("WIND")
 } wind_sensor_payload_t;
 
@@ -2087,18 +2146,16 @@ static void sendCalibCommand(bool enter) {
     cmd.mode = enter ? 1 : 0;
     cmd.magic[0] = 0xCA; cmd.magic[1] = 0x1B;
     cmd.magic[2] = 0xCA; cmd.magic[3] = 0x1B;
-    IPAddress broadcastIP = WiFi.localIP();
-    broadcastIP[3] = 255;
-    // Send a few times for reliability
+    IPAddress windTxIP(192, 168, 4, 123);
     for (int i = 0; i < 3; i++) {
-        udp.beginPacket(broadcastIP, UDP_PORT);
+        udp.beginPacket(windTxIP, UDP_PORT);
         udp.write((uint8_t*)&cmd, sizeof(cmd));
         udp.endPacket();
         delay(20);
     }
 }
 
-// UPDATE the handleUDP() function's wind packet handler:
+// UDP packet handler
 void handleUDP() {
     int packetSize = udp.parsePacket();
     if (packetSize) {
@@ -2169,17 +2226,9 @@ void handleUDP() {
                 // Capture raw ADC value for calibration live readout
                 calibLiveWinddirV = payload.winddirV;
                 
-                // UPDATE: Store the window settings from transmitter
-                currentAvgWindow = payload.avgWindow;
-                currentGustWindow = payload.gustWindow;
-                
-                // UPDATE: Update the spinbox values if we're on the settings screen
-                if (lv_screen_active() == ui_ScreenSettings) {
-                    if (ui_Spinbox1 != NULL && ui_Spinbox2 != NULL) {
-                        lv_spinbox_set_value(ui_Spinbox1, (int32_t)currentAvgWindow);
-                        lv_spinbox_set_value(ui_Spinbox2, (int32_t)currentGustWindow);
-                    }
-                }
+                // NOTE: avgWindow / gustWindow are owned by seantempLVGL (stored in prefs).
+                // We do NOT read them back from the transmitter payload — the transmitter
+                // is a follower, not the source of truth for these values.
 
                 // Accumulate into the 20-reading buffer.
                 // The transmitter already snapped winddirV to the nearest of 16
@@ -2400,11 +2449,18 @@ void drawWindRose() {
                 arc_dsc.rounded = 0;
                 arc_dsc.center.x = centerX;
                 arc_dsc.center.y = centerY;
-                arc_dsc.radius = (int16_t)radius;
                 arc_dsc.start_angle = startAngle;
                 arc_dsc.end_angle = endAngle;
                 
+                // Draw primary arc
+                arc_dsc.radius = (int16_t)radius;
                 lv_draw_arc(&layer, &arc_dsc);
+                
+                // Draw secondary arc 1 pixel inward to fill gaps and eliminate moiré
+                if (radius > 1.0f) {
+                    arc_dsc.radius = (int16_t)(radius - 1.0f);
+                    lv_draw_arc(&layer, &arc_dsc);
+                }
             }
             
             currentRadius = outerRadius;
@@ -2835,6 +2891,16 @@ void setup() {
         Blynk.config(auth, IPAddress(216, 110, 224, 105), 8080);
     }
 }
+float dewPoint(float T, float RH);
+float dewPoint(float T, float RH) {
+  const float a = 17.27;
+  const float b = 237.7; // °C
+
+  float gamma = (a * T) / (b + T) + log(RH / 100.0);
+  float Td = (b * gamma) / (a - gamma);
+
+  return Td;
+}
 
 
 void loop() {
@@ -3012,6 +3078,9 @@ void loop() {
       
       const char* cardinal = getCardinalDirection(direction);
       lv_label_set_text(ui_LabelWindDir, cardinal);
+      
+      // Update wind rose timeframe label
+      updateWindRoseTimeframeLabel();
     }
     
     // Update time display (LabelTime)
@@ -3050,7 +3119,7 @@ void loop() {
 
   }
   
-  every(30000) {
+  every(60000) {
     // Send latest wind data to Blynk every 30 seconds
     if (!blynkEnabled) return; 
     if (windHistory != nullptr && windHistoryCount > 0) {
@@ -3058,6 +3127,22 @@ void loop() {
       Blynk.virtualWrite(V12, windHistory[lastIdx].speed);
       Blynk.virtualWrite(V13, s2windgust);
       Blynk.virtualWrite(V15, windHistory[lastIdx].direction);
+      
+      // Calculate circular mean of last 60 windHistory entries for hourly direction → V49
+      // Circular mean correctly handles wrap-around (e.g. 350° + 10° → 0°, not 180°).
+      unsigned int lookback = (windHistoryCount < 60) ? windHistoryCount : 60;
+      float cirSinSum = 0.0f, cirCosSum = 0.0f;
+      for (unsigned int i = 0; i < lookback; i++) {
+        int idx = (windHistoryIndex - 1 - i + windHistoryCapacity) % windHistoryCapacity;
+        float rad = windHistory[idx].direction * (M_PI / 180.0f);
+        cirSinSum += sinf(rad);
+        cirCosSum += cosf(rad);
+      }
+      float cirMeanRad = atan2f(cirSinSum, cirCosSum);
+      if (cirMeanRad < 0.0f) cirMeanRad += 2.0f * M_PI;
+      hourlyModeDirection = cirMeanRad * (180.0f / M_PI);
+      if (hourlyModeDirection >= 360.0f) hourlyModeDirection -= 360.0f;
+      
     }
     Blynk.virtualWrite(V14, WiFi.RSSI());
 
@@ -3066,18 +3151,22 @@ void loop() {
       if (sensorHistory[0] != nullptr && sensorHistoryCount[0] > 0) {
         int idx = (sensorHistoryIndex[0] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
         Blynk.virtualWrite(V16, sensorHistory[0][idx].temp);
+        Blynk.virtualWrite(V50, sensorHistory[0][idx].pres);
       }
       if (sensorHistory[1] != nullptr && sensorHistoryCount[1] > 0) {
         int idx = (sensorHistoryIndex[1] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
         Blynk.virtualWrite(V17, sensorHistory[1][idx].temp);
+        Blynk.virtualWrite(V51, sensorHistory[1][idx].pres);
       }
       if (sensorHistory[2] != nullptr && sensorHistoryCount[2] > 0) {
         int idx = (sensorHistoryIndex[2] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
         Blynk.virtualWrite(V18, sensorHistory[2][idx].temp);
+        Blynk.virtualWrite(V52, sensorHistory[2][idx].pres);
       }
       if (sensorHistory[3] != nullptr && sensorHistoryCount[3] > 0) {
         int idx = (sensorHistoryIndex[3] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
         Blynk.virtualWrite(V19, sensorHistory[3][idx].temp);
+        Blynk.virtualWrite(V53, sensorHistory[3][idx].pres);
       }
 
       if (sensorHistory[0] != nullptr && sensorHistoryCount[0] > 0) {
@@ -3086,6 +3175,9 @@ void loop() {
         float temp = sensorHistory[0][idx].temp;
         float abshum =  (6.112 * pow(2.71828, ((17.67 * temp)/(temp + 243.5))) * hum * 2.1674)/(273.15 + temp);
         Blynk.virtualWrite(V21, abshum);
+        Blynk.virtualWrite(40, hum);
+        Blynk.virtualWrite(44, dewPoint(temp, hum));
+
       }
       if (sensorHistory[1] != nullptr && sensorHistoryCount[1] > 0) {
         int idx = (sensorHistoryIndex[1] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
@@ -3093,6 +3185,8 @@ void loop() {
         float temp = sensorHistory[1][idx].temp;
         float abshum =  (6.112 * pow(2.71828, ((17.67 * temp)/(temp + 243.5))) * hum * 2.1674)/(273.15 + temp);
         Blynk.virtualWrite(V22, abshum);
+        Blynk.virtualWrite(41, hum);
+        Blynk.virtualWrite(45, dewPoint(temp, hum));
       }
       if (sensorHistory[2] != nullptr && sensorHistoryCount[2] > 0) {
         int idx = (sensorHistoryIndex[2] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
@@ -3100,6 +3194,8 @@ void loop() {
         float temp = sensorHistory[2][idx].temp;
         float abshum =  (6.112 * pow(2.71828, ((17.67 * temp)/(temp + 243.5))) * hum * 2.1674)/(273.15 + temp);
         Blynk.virtualWrite(V23, abshum);
+        Blynk.virtualWrite(42, hum);
+        Blynk.virtualWrite(46, dewPoint(temp, hum));
       }
       if (sensorHistory[3] != nullptr && sensorHistoryCount[3] > 0) {
         int idx = (sensorHistoryIndex[3] - 1 + sensorHistoryCapacity) % sensorHistoryCapacity;
@@ -3107,9 +3203,15 @@ void loop() {
         float temp = sensorHistory[3][idx].temp;
         float abshum =  (6.112 * pow(2.71828, ((17.67 * temp)/(temp + 243.5))) * hum * 2.1674)/(273.15 + temp);
         Blynk.virtualWrite(V24, abshum);
+        Blynk.virtualWrite(43, hum);
+        Blynk.virtualWrite(47, dewPoint(temp, hum));    
       }
+
   }
  // every(60000){
  //   sendSliderValuesToWindTransmitter();
  // }
+ every(3600000) {
+    Blynk.virtualWrite(V49, hourlyModeDirection);
+ }
 }

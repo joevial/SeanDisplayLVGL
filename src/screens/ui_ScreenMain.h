@@ -62,6 +62,7 @@ extern void ui_event_LabelWind1(lv_event_t * e);
 extern lv_obj_t * ui_LabelWind1;
 extern lv_obj_t * ui_Label17;
 extern lv_obj_t * ui_Label21;
+extern lv_obj_t * ui_LabelLast24hrs;
 // CUSTOM VARIABLES
 
 #ifdef __cplusplus
